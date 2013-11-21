@@ -1,0 +1,13 @@
+{application, crdt_wal,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  riak_dt
+                 ]},
+  {mod, { crdt_wal_app, []}},
+  {env, []}
+ ]}.
