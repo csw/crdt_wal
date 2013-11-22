@@ -7,10 +7,8 @@
 -include_lib("kernel/include/file.hrl").
 -include("wal_pb.hrl").
 
--export([create_log/2, open_log/2, append/2, read_log_from/3]).
-% probably doesn't need to be exported, but the compiler complained it
-% wasn't used...
--export([lsn_to_offset/2]).
+-export([create_log/2, open_log/2, close_log/1, log_info/1,
+         append/2, read_log_from/3]).
 
 -define(LOG_MAGIC, <<16#BF, 16#9A, 16#02, 16#C7, "CRDT">>).
 -define(CKPT_MAGIC, <<16#BF, 16#9A, 16#02, 16#C7, "CKPT">>).
@@ -69,6 +67,18 @@ create_log(Dir, StartLSN) ->
     ok = file:write_file(Path, [?LOG_MAGIC, HData], [exclusive]),
     {ok, Path}.
 
+log_info(Path) ->
+    {ok, LS=#log_state{start_lsn=StartLSN,
+                       next_lsn=NextLSN}} =
+        open_log(Path, read),
+    io:format("WAL ~s:~nStarting LSN: ~w~nLog bytes: ~w~nNext LSN:~w~n",
+             [Path,
+              StartLSN,
+              lsn_to_offset(LS, NextLSN)-?LOG_DATA_START,
+              NextLSN]),
+    ok = close_log(LS),
+    ok.
+
 -spec open_log(file:name_all(), 'append' | 'read') -> {'ok', #log_state{}}.
 
 open_log(Path, Mode) ->
@@ -86,6 +96,12 @@ open_log(Path, Mode) ->
                     mode=Mode,
                     start_lsn=StartLSN,
                     next_lsn=NextLSN}}.
+
+-spec close_log(#log_state{}) -> 'ok'.
+
+close_log(#log_state{iodev=IODev}) ->
+    ok = file:close(IODev),
+    ok.
 
 -spec append(#log_state{mode :: 'append'}, #tx_rec{})
             -> {'ok', #log_state{mode :: 'append'}}.
