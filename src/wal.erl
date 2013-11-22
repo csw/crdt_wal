@@ -177,7 +177,7 @@ encode_framed(Record, PadAlign) ->
 decode_framed(Decoder, Align,
               <<RSize:32, RBin:RSize/binary, CRC:32,
                 Trailing/binary>>) when is_integer(Align) ->
-    PadBytes = ((RSize+8-Align) rem Align),
+    PadBytes = padding_bytes(RSize+8, Align),
     case Trailing of
         <<_Padding:PadBytes/unit:8, Rest/binary>> ->
             %% correctly padded
@@ -192,13 +192,19 @@ decode_framed(_Decoder, _Align, Partial)
 
 
 %% PKCS#7 style padding
-padding_to(0, _Align) ->
-    <<>>;
-padding_to(Size, Align) when Size < Align ->
-    PadBytes = Align - Size,
-    binary:copy(<<PadBytes:1/unit:8>>, PadBytes);
 padding_to(Size, Align) ->
-    padding_to(Size rem Align, Align).
+    case padding_bytes(Size, Align) of
+        0 -> <<>>;
+        N -> binary:copy(<<N:1/unit:8>>, N)
+    end.
+
+padding_bytes(0, _Align) ->
+    0;
+padding_bytes(Size, Align) when Size < Align ->
+    Align - Size;
+padding_bytes(Size, Align) ->
+    padding_bytes(Size rem Align, Align).
+
 
 
 unix_timestamp() ->
