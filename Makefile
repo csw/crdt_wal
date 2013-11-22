@@ -15,10 +15,13 @@
 # under the License.
 #
 
-ERLFLAGS += -pz $(CURDIR)/.eunit -pz $(CURDIR)/ebin -pz $(CURDIR)/deps/*/ebin
+ERLFLAGS += -pz $(CURDIR)/.eunit -pz $(CURDIR)/ebin \
+	-pz $(CURDIR)/deps/*/ebin
 
 DEPS_PLT=$(CURDIR)/.deps_plt
-DEPS=erts kernel stdlib riak_dt
+DEPS=erts kernel stdlib riak_dt protobuffs
+
+DEP_LIBS=$(shell echo $(CURDIR)/deps/* | tr ' ' :)
 
 # =============================================================================
 # Verify that the programs we need to run are installed on this system
@@ -52,7 +55,7 @@ update-deps:
 	$(REBAR) update-deps
 	$(REBAR) compile
 
-compile:
+compile: src/wal_pb.erl
 	$(REBAR) skip_deps=true compile
 
 doc:
@@ -98,3 +101,6 @@ distclean: clean
 	- rm -rvf $(CURDIR)/deps
 
 rebuild: distclean deps compile escript dialyzer test
+
+src/wal_pb.erl: src/wal.proto
+	ERL_LIBS=$(DEP_LIBS) bin/protoc-erl-csw src/wal.proto
