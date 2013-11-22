@@ -59,14 +59,15 @@
 %% increments
 
 -spec create_log(file:name_all(), non_neg_integer())
-                -> 'ok' | {'error', term()}.
+                -> {'ok', file:name_all()}.
 
 create_log(Dir, StartLSN) ->
     Path = log_path(Dir, StartLSN),
     Header = #log_header{version=?VERSION, start_lsn=StartLSN},
     {ok, HData, ?LOG_HDR_BYTES} = encode_framed(Header, ?LOG_HDR_BYTES),
     ?LOG_DATA_START = byte_size(?LOG_MAGIC) + ?LOG_HDR_BYTES,
-    file:write_file(Path, [?LOG_MAGIC, HData], [exclusive]).    
+    ok = file:write_file(Path, [?LOG_MAGIC, HData], [exclusive]),
+    {ok, Path}.
 
 -spec open_log(file:name_all(), 'append' | 'read') -> {'ok', #log_state{}}.
 
