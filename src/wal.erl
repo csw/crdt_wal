@@ -111,6 +111,7 @@ append(St=#log_state{mode=append, iodev=IODev, next_lsn=NextLSN},
     LogRec = build_record(TXRec, NextLSN),
     {ok, Data, RecSize} = encode_framed(LogRec, ?LOG_ALIGN),
     ok = file:write(IODev, Data),
+    ok = file:sync(IODev),
     LSNDelta = RecSize div ?LOG_ALIGN,
     {ok, St#log_state{next_lsn=NextLSN + LSNDelta}}.
 
