@@ -191,12 +191,14 @@ decode_framed(_Decoder, _Align, Partial)
     {partial, Partial}.
 
 
-padding_to(Size, Align) when Size rem Align == 0 ->
+%% PKCS#7 style padding
+padding_to(0, _Align) ->
     <<>>;
-padding_to(Size, Align) when Align >= 0 andalso Align < 256 ->
-    %% PKCS#7 style
-    PadBytes = (Size - Align) rem Align,
-    binary:copy(<<PadBytes:8>>, PadBytes).
+padding_to(Size, Align) when Size < Align ->
+    PadBytes = Align - Size,
+    binary:copy(<<PadBytes:1/unit:8>>, PadBytes);
+padding_to(Size, Align) ->
+    padding_to(Size rem Align, Align).
 
 
 unix_timestamp() ->
