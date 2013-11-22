@@ -1,0 +1,30 @@
+message Log_Header {
+    required uint32         version = 1;
+    optional uint64         start_lsn = 2; 
+}
+
+message Log_Rec {
+    required uint64         lsn = 1;
+    required int64          tstamp = 2;
+    optional Tx_Rec         tx = 3;
+}
+
+enum CRDT_Type {
+    riak_dt_orswot = 1;
+}
+
+message Tx_Rec {
+    required bytes     bucket = 1;
+    required bytes     key = 2;
+    required bytes     client_id = 3;
+    required bytes     request_id = 4;
+    required CRDT_Type crdt_type = 5;
+    required bytes     operations = 6;
+}
+
+message Checkpoint_Rec {
+    required int64     tstamp = 1;
+    required uint64    recovery_lsn = 2;
+    required uint64    last_known_lsn = 3;
+    required string    clock_file = 4;
+}
