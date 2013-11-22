@@ -118,12 +118,16 @@ append(St=#log_state{mode=append, iodev=IODev, next_lsn=NextLSN},
 -spec read_log_from(#log_state{mode :: 'read'},
                     lsn(),
                     fun((#log_rec{}) -> 'ok' | 'stop'))
-                   -> 'ok'.
+                   -> 'ok' | {'error', 'past_end', lsn()}.
 
 read_log_from(LS=#log_state{mode=read, iodev=Dev}, FromLSN, Handler) ->
     StartPos = lsn_to_offset(LS, FromLSN),
-    {ok, StartPos} = file:position(Dev, StartPos),
-    read_log_recs(LS, FromLSN, Handler, <<>>).
+    case file:position(Dev, StartPos) of
+        {ok, StartPos} ->
+            read_log_recs(LS, FromLSN, Handler, <<>>);
+        {error, einval} ->
+            {error, past_end, FromLSN}
+    end.
 
 read_log_recs(LS=#log_state{mode=read, iodev=Dev}, LSN, Handler, Buffer) ->
     case decode_framed(fun wal_pb:decode_log_rec/1, ?LOG_ALIGN, Buffer) of
