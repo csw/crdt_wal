@@ -14,12 +14,9 @@ enum CRDT_Type {
 }
 
 message Tx_Rec {
-    required bytes     bucket = 1;
+    optional bytes     bucket = 1;
     required bytes     key = 2;
-    required bytes     client_id = 3;
-    required bytes     request_id = 4;
-    required CRDT_Type crdt_type = 5;
-    required bytes     operations = 6;
+    required bytes     operations = 3;
 }
 
 message Checkpoint_Rec {

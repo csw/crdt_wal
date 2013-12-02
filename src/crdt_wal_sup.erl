@@ -24,5 +24,9 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
-    {ok, { {one_for_one, 5, 10}, []} }.
+    {ok, { {one_for_all, 5, 10}, [?CHILD(crdt_server_sup, supervisor),
+                                  ?CHILD(storage, worker),
+                                  ?CHILD(crdt_service, worker),
+                                  ?CHILD(wal_mgr, worker)
+                                 ]} }.
 

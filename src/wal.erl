@@ -1,4 +1,5 @@
 -module(wal).
+-compile(export_all).
 
 %% Write-ahead log (WAL) library.
 %%
@@ -8,7 +9,10 @@
 -include("wal_pb.hrl").
 
 -export([create_log/2, open_log/2, close_log/1, log_info/1,
-         append/2, read_log_from/3]).
+         append/2, read_log_from/3, start_lsn/1, next_lsn/1,
+         open_dir/1, init_dir/1]).
+-export([parse_lsn/1, parse_ckpt_path/1]).
+-export_type([lsn/0]).
 
 -define(LOG_MAGIC, <<16#BF, 16#9A, 16#02, 16#C7, "CRDT">>).
 -define(CKPT_MAGIC, <<16#BF, 16#9A, 16#02, 16#C7, "CKPT">>).
@@ -18,6 +22,7 @@
 -define(VERSION, 1).
 
 -type lsn() :: non_neg_integer().
+-type checkpoint_num () :: non_neg_integer().
 
 -record(log_state, {dir       :: file:name_all(),
                     file      :: file:name_all(),
@@ -56,6 +61,35 @@
 %% If the LSN gives the starting offset in 64-byte (2^6 byte)
 %% increments
 
+start_lsn(#log_state{start_lsn=LSN}) when is_integer(LSN) ->
+    LSN.
+next_lsn(#log_state{next_lsn=LSN}) when is_integer(LSN) ->
+    LSN.
+
+open_dir(Dir) ->
+    case list_checkpoints(Dir) of
+        [] ->
+            [] = list_logs(Dir),
+            {ok, Log, LSN, Checkpoint} = init_dir(Dir),
+            {ready, Log, LSN, Checkpoint};
+        CS ->
+            {CNum, CPath} = lists:max(CS),
+            {checkpoint, CNum, RecoveryLSN} = read_checkpoint(CPath),
+            {ok, Logs} = find_logs_for_lsn(Dir, RecoveryLSN),
+            {recover, Logs, RecoveryLSN, CNum}
+    end.
+    
+
+-spec init_dir(file:name_all()) ->
+                      {'ok', file:name_all(), lsn(), file:name_all() }.
+init_dir(Dir) ->
+    [] = list_logs(Dir),
+    StartLSN = 0,
+    Checkpoint = 0,
+    {ok, Log} = create_log(Dir, StartLSN),
+    {ok, _CPF} = write_checkpoint(Dir, {checkpoint, Checkpoint, StartLSN}),
+    {ok, Log, StartLSN, Checkpoint}.
+
 -spec create_log(file:name_all(), non_neg_integer())
                 -> {'ok', file:name_all()}.
 
@@ -66,6 +100,59 @@ create_log(Dir, StartLSN) ->
     ?LOG_DATA_START = byte_size(?LOG_MAGIC) + ?LOG_HDR_BYTES,
     ok = file:write_file(Path, [?LOG_MAGIC, HData], [exclusive]),
     {ok, Path}.
+
+find_logs_for_lsn(Dir, TargetLSN) ->
+    {Before, After} =
+        lists:partition(fun({LSN, _Path}) -> LSN < TargetLSN end,
+                        list_logs(Dir)),
+    case lists:sort(After) of
+        [] ->
+            {error, past_end};
+        [{TargetLSN, _Path}|_LS]=AfterS ->
+            %% exact match
+            {ok, [Path || {_LSN, Path} <- AfterS]};
+        AfterS when Before /= [] ->
+            {_LSN, BPath} = lists:max(Before),
+            {ok, [BPath] ++ [Path || {_LSN_, Path} <- AfterS]}
+    end.
+            
+
+list_logs(Dir) ->
+    list_files(Dir, "wal_*.log", fun parse_lsn/1).
+
+list_checkpoints(Dir) ->
+    list_files(Dir, "c_*.ckpt", fun parse_ckpt_path/1).
+
+list_files(Dir, Pattern, Parse) ->
+    Files = filelib:wildcard(filename:join(Dir, Pattern)),
+    [ Parse(File) || File <- Files ].
+
+parse_lsn(Path) ->
+    {ok, [LSN], []} = io_lib:fread("wal_~16u.log", filename:basename(Path)),
+    {LSN, Path}.
+
+parse_ckpt_path(Path) ->
+    {ok, [CNum], []} = io_lib:fread("c_~16u.ckpt", filename:basename(Path)),
+    {CNum, Path}.
+
+write_checkpoint(Dir, {checkpoint, Num, LSN}) ->
+    Path = checkpoint_path(Dir, Num),
+    {error, enoent} = file:read_file_info(Path),
+    TmpPath = [Path, ".tmp"],
+    {ok, IODev} = file:open(TmpPath, [write, append, binary, raw]),
+    ok = file:write(IODev, [?CKPT_MAGIC,
+                            term_to_binary({checkpoint, Num, LSN})]),
+    ok = file:sync(IODev),
+    ok = file:close(IODev),
+    ok = file:rename(TmpPath, Path),
+    {ok, Path}.
+
+read_checkpoint(Path) ->
+    {ok, Bin} = file:read_file(Path),
+    Magic = ?CKPT_MAGIC,
+    << Magic:8/binary, CRec/binary >> = Bin,
+    R={checkpoint, _, _} = binary_to_term(CRec, [safe]),
+    R.
 
 log_info(Path) ->
     {ok, LS=#log_state{start_lsn=StartLSN,
@@ -129,7 +216,8 @@ read_log_from(LS=#log_state{mode=read, iodev=Dev}, FromLSN, Handler) ->
             {error, past_end, FromLSN}
     end.
 
-read_log_recs(LS=#log_state{mode=read, iodev=Dev}, LSN, Handler, Buffer) ->
+read_log_recs(LS=#log_state{file=F, mode=read, iodev=Dev},
+              LSN, Handler, Buffer) ->
     case decode_framed(fun wal_pb:decode_log_rec/1, ?LOG_ALIGN, Buffer) of
         {ok, Rec=#log_rec{lsn=LSN}, RecSize, Rest} ->
             Handler(Rec),
@@ -141,7 +229,11 @@ read_log_recs(LS=#log_state{mode=read, iodev=Dev}, LSN, Handler, Buffer) ->
                                   <<Buffer/binary, Buf2/binary>>);
                 eof ->
                     case Buffer of
-                        <<>> -> ok
+                        <<>> ->
+                            ok;
+                        _Bin ->
+                            {ok, Pos} = file:position(Dev, cur),
+                            {error, {garbage, F, Pos}}
                     end
             end
     end.
@@ -178,7 +270,11 @@ lsn_to_offset(StartLSN, LSN) ->
 
 log_path(Dir, StartLSN) ->
     filename:join(Dir,
-                  io_lib:format("wal_~w.log", [StartLSN])).
+                  io_lib:format("wal_~16.16.0B.log", [StartLSN])).
+
+checkpoint_path(Dir, CNum) ->
+    filename:join(Dir,
+                  io_lib:format("c_~.16B.ckpt", [CNum])).
 
 build_record(TX=#tx_rec{}, LSN) ->
     #log_rec{lsn=LSN,
@@ -207,8 +303,7 @@ decode_framed(Decoder, Align,
         _ ->
             {partial, Trailing}
     end;
-decode_framed(_Decoder, _Align, Partial)
-  when is_binary(Partial), byte_size(Partial) > 0 ->
+decode_framed(_Decoder, _Align, Partial) when is_binary(Partial) ->
     {partial, Partial}.
 
 

@@ -18,11 +18,8 @@
 -ifndef(TX_REC_PB_H).
 -define(TX_REC_PB_H, true).
 -record(tx_rec, {
-    bucket = erlang:error({required, bucket}),
+    bucket,
     key = erlang:error({required, key}),
-    client_id = erlang:error({required, client_id}),
-    request_id = erlang:error({required, request_id}),
-    crdt_type = erlang:error({required, crdt_type}),
     operations = erlang:error({required, operations})
 }).
 -endif.

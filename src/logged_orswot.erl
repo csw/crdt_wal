@@ -1,0 +1,638 @@
+%% -------------------------------------------------------------------
+%%
+%% riak_dt_orswot: Tombstone-less, replicated, state based observe remove set
+%%
+%% logged_orswot: Variant with WAL logging support
+%%
+%% Copyright (c) 2007-2013 Basho Technologies, Inc.  All Rights Reserved.
+%%
+%% This file is provided to you under the Apache License,
+%% Version 2.0 (the "License"); you may not use this file
+%% except in compliance with the License.  You may obtain
+%% a copy of the License at
+%%
+%%   http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing,
+%% software distributed under the License is distributed on an
+%% "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+%% KIND, either express or implied.  See the License for the
+%% specific language governing permissions and limitations
+%% under the License.
+%%
+%% -------------------------------------------------------------------
+
+%% @doc An OR-Set CRDT. An OR-Set allows the adding, and removal, of
+%% elements. Should an add and remove be concurrent, the add wins. In
+%% this implementation there is a version vector for the whole set.
+%% When an element is added to the set, the version vector is
+%% incremented and the `{actor(), count()}' pair for that increment is
+%% stored against the element as its "birth dot". Every time the
+%% element is re-added to the set, its "birth dot" is updated to that
+%% of the `{actor(), count()}' version vector entry resulting from the
+%% add. When an element is removed, we simply drop it, no tombstones.
+%%
+%% When an element exists in replica A and not replica B, is it
+%% because A added it and B has not yet seen that, or that B removed
+%% it and A has not yet seen that? Usually the presence of a tombstone
+%% arbitrates. In this implementation we compare the "birth dot" of
+%% the present element to the clock in the Set it is absent from. If
+%% the element dot is not "seen" by the Set clock, that means the
+%% other set has yet to see this add, and the item is in the merged
+%% Set. If the Set clock dominates the dot, that means the other Set
+%% has removed this element already, and the item is not in the merged
+%% Set.
+%%
+%% Essentially we've made a dotted version vector.
+%%
+%% @see riak_dt_multi, riak_dt_vclock
+%%
+%% @reference Marc Shapiro, Nuno Preguiça, Carlos Baquero, Marek
+%% Zawirski (2011) A comprehensive study of Convergent and Commutative
+%% Replicated Data Types. http://hal.upmc.fr/inria-00555588/
+%%
+%% @reference Annette Bieniusa, Marek Zawirski, Nuno Preguiça, Marc
+%% Shapiro, Carlos Baquero, Valter Balegas, Sérgio Duarte (2012) An
+%% Optimized Conﬂict-free Replicated Set
+%% http://arxiv.org/abs/1210.3368
+%%
+%% @reference Nuno Preguiça, Carlos Baquero, Paulo Sérgio Almeida,
+%% Victor Fonte, Ricardo Gonçalves http://arxiv.org/abs/1011.5808
+%%
+%% @end
+-module(logged_orswot).
+
+-behaviour(riak_dt).
+
+-ifdef(EQC).
+-include_lib("eqc/include/eqc.hrl").
+-define(QC_OUT(P),
+        eqc:on_output(fun(Str, Args) ->
+                              io:format(user, Str, Args) end, P)).
+-define(NUMTESTS, 1000).
+-endif.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
+%% API
+-export([new/0, value/1, value/2]).
+-export([update/3, merge/2, equal/2]).
+-export([prepare/3, effect/3]).
+-export([to_binary/1, from_binary/1]).
+-export([precondition_context/1]).
+
+%% EQC API
+-ifdef(EQC).
+-export([gen_op/0, update_expected/3, eqc_state_value/1]).
+-export([init_state/0, generate/0, size/1]).
+
+-endif.
+
+-export_type([orswot/0, orswot_op/0, binary_orswot/0]).
+
+-opaque orswot() :: {riak_dt_vclock:vclock(), entries()}.
+-type binary_orswot() :: binary(). %% A binary that from_binary/1 will operate on.
+
+-type orswot_op() ::  {add, member()} | {remove, member()} |
+                      {add_all, [member()]} | {remove_all, [member()]} |
+                      {update, [orswot_op()]}.
+-type orswot_q()  :: size | {contains, term()}.
+
+-type actor() :: riak_dt:actor().
+
+%% a dict of member() -> minimal_clock() mappings.  The
+%% `minimal_clock()' is a more effecient way of storing knowledge
+%% about adds / removes than a UUID per add.
+-type entries() :: [{member(), minimal_clock()}].
+
+%% a minimal clock is just the dots for the element, each dot being an
+%% actor and event counter for when the element was added.
+-type minimal_clock() :: [dot()].
+-type dot() :: {actor(), Count::pos_integer()}.
+-type member() :: term().
+
+-type precondition_error() :: {error, {precondition,
+                                       {not_present, member()} |
+                                       {not_descendant, minimal_clock()}}}.
+
+-spec new() -> orswot().
+new() ->
+    {riak_dt_vclock:fresh(), orddict:new()}.
+
+-spec value(orswot()) -> [member()].
+value({_Clock, Entries}) ->
+    [K || {K, _Dots} <- orddict:to_list(Entries)].
+
+-spec value(orswot_q(), orswot()) -> term().
+value(size, ORset) ->
+    length(value(ORset));
+value({contains, Elem}, ORset) ->
+    lists:member(Elem, value(ORset)).
+
+-spec update(orswot_op(), actor(), orswot()) -> {ok, orswot()} |
+                                                precondition_error().
+%% @doc take a list of Set operations and apply them to the set.
+%% NOTE: either _all_ are applied, or _none_ are.
+update({update, Ops}, Actor, ORSet) ->
+    apply_ops(lists:sort(Ops), Actor, ORSet);
+update({add, Elem}, Actor, ORSet) ->
+    {ok, add_elem(Actor, ORSet, Elem)};
+update({remove, Elem}, _Actor, ORSet) ->
+    {_Clock, Entries} = ORSet,
+    remove_elem(orddict:find(Elem, Entries), Elem, ORSet);
+update({add_all, Elems}, Actor, ORSet) ->
+    ORSet2 = lists:foldl(fun(E, S) ->
+                                 add_elem(Actor, S, E) end,
+                         ORSet,
+                         Elems),
+    {ok, ORSet2};
+
+%% @doc note: this is atomic, either _all_ `Elems` are removed, or
+%% none are.
+update({remove_all, Elems}, Actor, ORSet) ->
+    remove_all(Elems, Actor, ORSet).
+
+
+
+%% prepare(Op, Actor, Set) ->
+%%     case check_precondition(Op, Actor, Set) of
+%%         ok ->
+%%             do_prepare(Op, Actor, Set);
+%%         {ok, Ctx} ->
+            
+%%         duplicate ->
+%%             {duplicate, Set};
+%%         {precondition, Cond} ->
+%%             {error, {precondition, Cond}}
+%%     end.
+
+-type passive_add_op() :: {'passive_add', member()}.
+-type passive_remove_op() :: {'passive_remove', member()}.
+-type active_add_op() :: {'add', member()}.
+-type active_remove_op() :: {'remove_versions', member(), [dot()]}.
+-type prep_add_op()   :: {'add_at', member(), dot()}.
+-type prep_rem_op()   :: {}.
+
+
+
+prepare({passive_add, Elem}, _Actor, Set) ->
+    {ok, {add, Elem}, Set};
+prepare({passive_remove, Elem}, _Actor, Set={_Clock, Entries}) ->
+    case orddict:find(Elem, Entries) of
+        {ok, Dots} ->
+            {ok, {remove_versions, Elem, Dots}, Set};
+        error ->
+            {error, {precondition, {not_present, Elem}}}
+    end;
+prepare({add, Elem}, Actor, {Clock, Entries}) ->
+    NewClock = riak_dt_vclock:increment(Actor, Clock),
+    Dot = {Actor, riak_dt_vclock:get_counter(Actor, NewClock)},
+    {ok, {add_at, Elem, Dot}, {NewClock, Entries}};
+prepare(Op={remove_versions, _Elem, _Dots}, Actor, Set) ->
+    case check_precondition(Op, Actor, Set) of
+        ok ->
+            {ok, Op, Set};
+        {precondition, Cond} ->
+            {error, {precondition, Cond}}
+    end.
+
+
+effect(Op={add_at, Elem, Dot}, Actor, Set={Clock, Entries}) ->
+    case check_precondition(Op, Actor, Set) of
+        ok ->
+            {ok, {riak_dt_vclock:increment(Actor, Clock),
+                  update_entry(Elem, Entries, [Dot])}};
+        duplicate ->
+            Set
+    end;
+effect(Op={remove_versions, Elem, RmDots}, Actor, Set={Clock, Entries}) ->
+    case check_precondition(Op, Actor, Set) of
+        ok ->
+            case orddict:find(Elem, Entries) of
+                {ok, CurDots} ->
+                    %% entry exists in current set
+                    ResEntries = 
+                        case riak_dt_vclock:subtract_dots(CurDots, RmDots) of
+                            [] ->
+                                %% complete removal
+                                orddict:erase(Elem, Entries);
+                        Remaining ->
+                                %% partial removal
+                                orddict:store(Elem, Remaining, Entries)
+                        end,
+                    {ok, {Clock, ResEntries}};
+                error ->
+                    %% not present, no-op
+                    Set
+            end;
+        {precondition, Cond} ->
+            % not a descendant of the versions we're meant to remove!
+            {error, {precondition, Cond}}
+    end.
+
+check_precondition({add_at, _Elem, Dot={Actor, OpCtr}},
+                   Actor, {Clock, _Entries}) ->
+    case riak_dt_vclock:get_counter(Actor, Clock) of
+        CurCtr when OpCtr == CurCtr+1 ->
+            ok;
+        CurCtr when CurCtr >= OpCtr ->
+            duplicate;
+        _CurCtr ->
+            {precondition, {causality, Dot, Clock}}
+    end;
+check_precondition({remove_versions, _Elem, RmDots}, _Actor,
+                   {Clock, _Entries}) ->
+    case riak_dt_vclock:descends(Clock, RmDots) of
+        true ->
+            ok;
+        false ->
+            % not a descendant of the versions we're meant to remove!
+            {precondition, {not_descendant, RmDots}}
+    end.
+
+apply_ops([], _Actor, ORSet) ->
+    {ok, ORSet};
+apply_ops([Op | Rest], Actor, ORSet) ->
+    case update(Op, Actor, ORSet) of
+        {ok, ORSet2} ->
+            apply_ops(Rest, Actor, ORSet2);
+        Error ->
+            Error
+    end.
+
+remove_all([], _Actor, ORSet) ->
+    {ok, ORSet};
+remove_all([Elem | Rest], Actor, ORSet) ->
+    case update({remove, Elem}, Actor, ORSet) of
+        {ok, ORSet2} ->
+            remove_all(Rest, Actor, ORSet2);
+        Error ->
+            Error
+    end.
+
+-spec merge(orswot(), orswot()) -> orswot().
+merge({LHSClock, LHSEntries}, {RHSClock, RHSEntries}) ->
+    Clock = riak_dt_vclock:merge([LHSClock, RHSClock]),
+    %% If an element is in both dicts, merge it. If it occurs in one,
+    %% then see if its dots are dominated by the others whole set
+    %% clock. If so, then drop it, if not, keep it.
+    LHSKeys = sets:from_list(orddict:fetch_keys(LHSEntries)),
+    RHSKeys = sets:from_list(orddict:fetch_keys(RHSEntries)),
+    CommonKeys = sets:intersection(LHSKeys, RHSKeys),
+    LHSUnique = sets:subtract(LHSKeys, CommonKeys),
+    RHSUnique = sets:subtract(RHSKeys, CommonKeys),
+
+    Entries00 = merge_common_keys(CommonKeys, LHSEntries, RHSEntries),
+    Entries0 = merge_disjoint_keys(LHSUnique, LHSEntries, RHSClock, Entries00),
+    Entries = merge_disjoint_keys(RHSUnique, RHSEntries, LHSClock, Entries0),
+
+    {Clock, Entries}.
+
+%% @doc check if each element in `Entries' should be in the merged
+%% set.
+-spec merge_disjoint_keys(set(), orddict:orddict(),
+                          riak_dt_vclock:vclock(), orddict:orddict()) -> orddict:orddict().
+merge_disjoint_keys(Keys, Entries, SetClock, Accumulator) ->
+    sets:fold(fun(Key, Acc) ->
+                      Dots = orddict:fetch(Key, Entries),
+                      case riak_dt_vclock:descends(SetClock, Dots) of
+                          false ->
+                              %% Optimise the set of stored dots to
+                              %% include only those unseen
+                              NewDots = riak_dt_vclock:subtract_dots(Dots, SetClock),
+                              orddict:store(Key, NewDots, Acc);
+                          true ->
+                              Acc
+                      end
+              end,
+              Accumulator,
+              Keys).
+
+%% @doc merges the minimal clocks for the common entries in both sets.
+-spec merge_common_keys(set(), orddict:orddict(), orddict:orddict()) -> orddict:orddict().
+merge_common_keys(CommonKeys, Entries1, Entries2) ->
+    sets:fold(fun(Key, Acc) ->
+                      V1 = orddict:fetch(Key, Entries1),
+                      V2 = orddict:fetch(Key, Entries2),
+                      V = riak_dt_vclock:merge([V1, V2]),
+                      orddict:store(Key, V, Acc) end,
+              orddict:new(),
+              CommonKeys).
+
+-spec equal(orswot(), orswot()) -> boolean().
+equal({Clock1, Entries1}, {Clock2, Entries2}) ->
+    riak_dt_vclock:equal(Clock1, Clock2) andalso
+        orddict:fetch_keys(Entries1) == orddict:fetch_keys(Entries2) andalso
+        clocks_equal(Entries1, Entries2).
+
+-spec clocks_equal(orddict:orddict(), orddict:orddict()) -> boolean().
+clocks_equal([], _) ->
+    true;
+clocks_equal([{Elem, Clock1} | Rest], Entries2) ->
+    Clock2 = orddict:fetch(Elem, Entries2),
+    case riak_dt_vclock:equal(Clock1, Clock2) of
+        true ->
+            clocks_equal(Rest, Entries2);
+        false ->
+            false
+    end.
+
+%% Private
+-spec add_elem(actor(), orswot(), member()) -> orswot().
+add_elem(Actor, {Clock, Entries}, Elem) ->
+    NewClock = riak_dt_vclock:increment(Actor, Clock),
+    Dot = [{Actor, riak_dt_vclock:get_counter(Actor, NewClock)}],
+    {NewClock, update_entry(Elem, Entries, Dot)}.
+
+-spec update_entry(member(), orddict:orddict(), riak_dt_vclock:vclock()) ->
+                          orddict:orddict().
+update_entry(Elem, Entries, Dot) ->
+    orddict:update(Elem, fun(Clock) ->
+                                 riak_dt_vclock:merge([Clock, Dot]) end,
+                   Dot,
+                   Entries).
+
+-spec remove_elem({ok, riak_dt_vclock:vclock()} | error,
+                  member(), {riak_dt_vclock:vclock(), orddict:orddict()}) ->
+                         {ok, riak_dt_vclock:vclock(), orddict:orddict()} |
+                         precondition_error().
+remove_elem({ok, _VClock}, Elem, {Clock, Dict}) ->
+    {ok, {Clock, orddict:erase(Elem, Dict)}};
+remove_elem(_, Elem, _ORSet) ->
+    {error, {precondition, {not_present, Elem}}}.
+
+%% @doc the precondition context is a fragment of the CRDT
+%% that operations with pre-conditions can be applied too.
+%% In the case of OR-Sets this is the set of adds observed.
+%% The system can then apply a remove to this context and merge it with a replica.
+%% Especially useful for hybrid op/state systems where the context of an operation is
+%% needed at a replica without sending the entire state to the client.
+-spec precondition_context(orswot()) -> orswot().
+precondition_context(ORSet) ->
+    ORSet.
+
+-define(TAG, 75).
+-define(V1_VERS, 1).
+
+%% @doc returns a binary representation of the provided
+%% `orswot()'. Measurements show that for all but the empty set this
+%% function is more effecient than using
+%% `erlang:term_to_binary/1'. The resulting binary is tagged and
+%% versioned for ease of future upgrade. Calling `from_binary/1' with
+%% the result of this function will return the original set.
+%%
+%% @see `from_binary/1'
+-spec to_binary(orswot()) -> binary_orswot().
+to_binary({Clock, Entries}) ->
+    Actors0 = riak_dt_vclock:all_nodes(Clock),
+    Actors = lists:zip(Actors0, lists:seq(1, length(Actors0))),
+    BinClock = riak_dt_vclock:to_binary(Clock),
+    ClockLen = byte_size(BinClock),
+    %% since each minimal clock can be at _most_ the size of the
+    %% vclock for the set, this saves us reserving 4 bytes for clock
+    %% len for each entry if we only needs 1 (for example)
+    ClockLenFieldLen = bit_size(binary:encode_unsigned(ClockLen)),
+    BinEntries = entries_to_binary(Entries, ClockLenFieldLen, Actors, <<>>),
+    <<?TAG:8/integer, ?V1_VERS:8/integer, ClockLenFieldLen:8/integer,
+      ClockLen:ClockLenFieldLen/integer,
+      BinClock:ClockLen/binary,
+      BinEntries/binary>>.
+
+%% @private inverse of `binary_to_entries/4'.
+-spec entries_to_binary(orddict:orddict(), pos_integer(),
+                        [{actor(), pos_integer()}], binary()) ->
+                                binary().
+entries_to_binary([], _,  _, EntriesBin) ->
+    EntriesBin;
+entries_to_binary([{Elem, MinmalClock} | Rest], ClockLenFieldLen, Actors, Acc) ->
+    ElemBin = elem_to_binary(Elem),
+    ElemLength = byte_size(ElemBin),
+    Clock = riak_dt_vclock:replace_actors(Actors, MinmalClock),
+    ClockBin = riak_dt_vclock:to_binary(Clock),
+    ClockLen = byte_size(ClockBin),
+    Bin = <<ElemLength:32/integer, ElemBin:ElemLength/binary, ClockLen:ClockLenFieldLen/integer, ClockBin:ClockLen/binary>>,
+    entries_to_binary(Rest, ClockLenFieldLen, Actors, <<Acc/binary, Bin/binary>>).
+
+%% @private inverse of `binary_to_elem/1'.
+-spec elem_to_binary(member()) -> binary().
+elem_to_binary(Elem) when is_binary(Elem) ->
+    <<1, Elem/binary>>;
+elem_to_binary(Elem) ->
+    <<0, (term_to_binary(Elem))/binary>>.
+
+%% @doc When the argument is a `binary_orswot()' produced by
+%% `to_binary/1' will return the original `orswot()'.
+%%
+%% @see `to_binary/1'
+-spec from_binary(binary_orswot()) -> orswot().
+from_binary(<<?TAG:8/integer, ?V1_VERS:8/integer, ClockLenFieldLen:8/integer,
+              ClockLen:ClockLenFieldLen/integer,
+              BinClock:ClockLen/binary, BinEntries/binary>>) ->
+    Clock = riak_dt_vclock:from_binary(BinClock),
+    Actors0 = riak_dt_vclock:all_nodes(Clock),
+    Actors = lists:zip(lists:seq(1, length(Actors0)), Actors0),
+    Entries = binary_to_entries(BinEntries, ClockLenFieldLen, Actors, orddict:new()),
+    {Clock, Entries}.
+
+%% @private inverse of `entries_to_binary/4'.
+-spec binary_to_entries(binary(), pos_integer(), [{pos_integer(), actor()}],
+                        orddict:orddict()) -> orddict:orddict().
+binary_to_entries(<<>>, _, _, Entries) ->
+ Entries;
+binary_to_entries(<<ElemLength:32/integer, ElemBin:ElemLength/binary, Rest0/binary>>,
+                  ClockLenFieldLen, Actors, Entries0) ->
+    Elem = binary_to_elem(ElemBin),
+    <<ClockLen:ClockLenFieldLen/integer, ClockBin:ClockLen/binary, Rest/binary>> = Rest0,
+    Clock0 = riak_dt_vclock:from_binary(ClockBin),
+    Clock = riak_dt_vclock:replace_actors(Actors, Clock0),
+    Entries = orddict:store(Elem, Clock, Entries0),
+    binary_to_entries(Rest, ClockLenFieldLen, Actors, Entries).
+
+%% @private inverse of `elem_to_binary/1'.
+-spec binary_to_elem(binary()) -> member().
+binary_to_elem(<<1, Bin/binary>>) ->
+    Bin;
+binary_to_elem(<<0, Bin/binary>>) ->
+    binary_to_term(Bin).
+
+
+%% ===================================================================
+%% EUnit tests
+%% ===================================================================
+-ifdef(TEST).
+
+-ifdef(EQC).
+
+bin_roundtrip_test_() ->
+    crdt_statem_eqc:run_binary_rt(?MODULE, ?NUMTESTS).
+
+eqc_value_test_() ->
+    crdt_statem_eqc:run(?MODULE, ?NUMTESTS).
+
+size(Set) ->
+    value(size, Set).
+
+generate() ->
+    ?LET({Ops, Actors}, {non_empty(list(gen_op(fun() -> bitstring(20*8) end))), non_empty(list(bitstring(16*8)))},
+         lists:foldl(fun(Op, Set) ->
+                             Actor = case length(Actors) of
+                                         1 -> hd(Actors);
+                                         _ -> lists:nth(crypto:rand_uniform(1, length(Actors)), Actors)
+                                     end,
+                             case logged_orswot:update(Op, Actor, Set) of
+                                 {ok, S} -> S;
+                                 _ -> Set
+                             end
+                     end,
+                     logged_orswot:new(),
+                     Ops)).
+
+%% EQC generator
+gen_op() ->
+    gen_op(fun() -> int() end).
+
+gen_op(Gen) ->
+    oneof([gen_updates(Gen), gen_update(Gen)]).
+
+gen_updates(Gen) ->
+     {update, non_empty(list(gen_update(Gen)))}.
+
+gen_update(Gen) ->
+    oneof([{add, Gen()}, {remove, Gen()},
+           {add_all, non_empty(list(Gen()))},
+           {remove_all, non_empty(list(Gen()))}]).
+
+init_state() ->
+    {0, dict:new()}.
+
+do_updates(_ID, [], _OldState, NewState) ->
+    NewState;
+do_updates(ID, [Update | Rest], OldState, NewState) ->
+    case {Update, update_expected(ID, Update, NewState)} of
+        {{Op, _Arg}, NewState} when Op == remove;
+                                   Op == remove_all ->
+            OldState;
+        {_, NewNewState} ->
+            do_updates(ID, Rest, OldState, NewNewState)
+    end.
+
+update_expected(ID, {update, Updates}, State) ->
+    do_updates(ID, lists:sort(Updates), State, State);
+update_expected(ID, {add, Elem}, {Cnt0, Dict}) ->
+    Cnt = Cnt0+1,
+    ToAdd = {Elem, Cnt},
+    {A, R} = dict:fetch(ID, Dict),
+    {Cnt, dict:store(ID, {sets:add_element(ToAdd, A), R}, Dict)};
+update_expected(ID, {remove, Elem}, {Cnt, Dict}) ->
+    {A, R} = dict:fetch(ID, Dict),
+    ToRem = [ {E, X} || {E, X} <- sets:to_list(A), E == Elem],
+    {Cnt, dict:store(ID, {A, sets:union(R, sets:from_list(ToRem))}, Dict)};
+update_expected(ID, {merge, SourceID}, {Cnt, Dict}) ->
+    {FA, FR} = dict:fetch(ID, Dict),
+    {TA, TR} = dict:fetch(SourceID, Dict),
+    MA = sets:union(FA, TA),
+    MR = sets:union(FR, TR),
+    {Cnt, dict:store(ID, {MA, MR}, Dict)};
+update_expected(ID, create, {Cnt, Dict}) ->
+    {Cnt, dict:store(ID, {sets:new(), sets:new()}, Dict)};
+update_expected(ID, {add_all, Elems}, State) ->
+    lists:foldl(fun(Elem, S) ->
+                       update_expected(ID, {add, Elem}, S) end,
+               State,
+               Elems);
+update_expected(ID, {remove_all, Elems}, {_Cnt, Dict}=State) ->
+    %% Only if _all_ elements are in the set do we remove any elems
+    {A, R} = dict:fetch(ID, Dict),
+    %% DO NOT consider tombstones as "in" the set, orswot does not have idempotent remove
+    In = sets:subtract(A, R),
+    Members = [ Elem || {Elem, _X} <- sets:to_list(In)],
+    case is_sub_bag(Elems, lists:usort(Members)) of
+        true ->
+            lists:foldl(fun(Elem, S) ->
+                                update_expected(ID, {remove, Elem}, S) end,
+                        State,
+                        Elems);
+        false ->
+            State
+    end.
+
+
+eqc_state_value({_Cnt, Dict}) ->
+    {A, R} = dict:fold(fun(_K, {Add, Rem}, {AAcc, RAcc}) ->
+                               {sets:union(Add, AAcc), sets:union(Rem, RAcc)} end,
+                       {sets:new(), sets:new()},
+                       Dict),
+    Remaining = sets:subtract(A, R),
+    Values = [ Elem || {Elem, _X} <- sets:to_list(Remaining)],
+    lists:usort(Values).
+
+%% Bag1 and Bag2 are multisets if Bag1 is a sub-multset of Bag2 return
+%% true, else false
+is_sub_bag(Bag1, Bag2) when length(Bag1) > length(Bag2) ->
+    false;
+is_sub_bag(Bag1, Bag2) ->
+    SubBag = lists:sort(Bag1),
+    SuperBag = lists:sort(Bag2),
+    is_sub_bag2(SubBag, SuperBag).
+
+is_sub_bag2([], _SuperBag) ->
+    true;
+is_sub_bag2([Elem | Rest], SuperBag) ->
+    case lists:delete(Elem, SuperBag) of
+        SuperBag ->
+            false;
+        SuperBag2 ->
+            is_sub_bag2(Rest, SuperBag2)
+    end.
+
+-endif.
+
+prep_add_test() ->
+    Set = new(),
+    Actor = a1,
+    {ok, Prep1, S1} = prepare({add, "moose"}, Actor, Set),
+    ?assertMatch({add_at, "moose", {Actor, 1}}, Prep1),
+    ?assertNot(value({contains, "moose"}, Set)),
+    ?assertNot(value({contains, "moose"}, S1)),
+    {ok, S2} = effect(Prep1, Actor, Set),
+    ?assert(value({contains, "moose"}, S2)),
+    _Bin = to_binary(S2).
+-endif.
+
+passive_add_test() ->
+    Set = new(),
+    {ok, PrepP, _PS1} = prepare({passive_add, "moose"}, passive, Set),
+    {ok, PrepA, _AS1} = prepare(PrepP, active, Set),
+    {ok, AS2} = effect(PrepA, active, Set),
+    ?assert(value({contains, "moose"}, AS2)),
+    _Bin = to_binary(AS2).
+
+prep_remove_test() ->
+    Set = new(),
+    Actor = a1,
+    {ok, Prep1, _S} = prepare({add, "moose"}, Actor, Set),
+    {ok, S2} = effect(Prep1, Actor, Set),
+    Dots = [{a1, 1}],
+    {ok, PrepR, _S3} = prepare({remove_versions, "moose", Dots},
+                              Actor, S2),
+    ?assertMatch({remove_versions, "moose", Dots}, PrepR),
+    {ok, S4} = effect(PrepR, Actor, S2),
+    ?assertMatch([], value(S4)),
+    _Bin = to_binary(S4),
+
+    %% and the precondition fails on the original
+    ?assertMatch({error, {precondition, _Cond}},
+                 prepare({remove_versions, "moose", Dots}, Actor, Set)).
+
+passive_remove_test() ->
+    Set = new(),
+    {ok, Prep1, _S} = prepare({add, "moose"}, active, Set),
+    {ok, S2} = effect(Prep1, active, Set),
+    {ok, PrepP, _PS1} = prepare({passive_remove, "moose"}, passive, S2),
+    ?assertMatch({remove_versions, "moose", [{active, 1}]}, PrepP),
+    {ok, PrepA, _AS2} = prepare(PrepP, active, S2),
+    {ok, AS3} = effect(PrepA, active, S2),
+    ?assertNot(value({contains, "moose"}, AS3)).
+

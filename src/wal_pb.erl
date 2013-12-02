@@ -20,9 +20,7 @@
 -record(checkpoint_rec,
 	{tstamp, recovery_lsn, last_known_lsn, clock_file}).
 
--record(tx_rec,
-	{bucket, key, client_id, request_id, crdt_type,
-	 operations}).
+-record(tx_rec, {bucket, key, operations}).
 
 -record(log_rec, {lsn, tstamp, tx}).
 
@@ -100,19 +98,11 @@ iolist(log_rec, Record) ->
      pack(3, optional, with_default(Record#log_rec.tx, none),
 	  tx_rec, [])];
 iolist(tx_rec, Record) ->
-    [pack(1, required,
+    [pack(1, optional,
 	  with_default(Record#tx_rec.bucket, none), bytes, []),
      pack(2, required, with_default(Record#tx_rec.key, none),
 	  bytes, []),
      pack(3, required,
-	  with_default(Record#tx_rec.client_id, none), bytes, []),
-     pack(4, required,
-	  with_default(Record#tx_rec.request_id, none), bytes,
-	  []),
-     pack(5, required,
-	  with_default(Record#tx_rec.crdt_type, none), crdt_type,
-	  []),
-     pack(6, required,
 	  with_default(Record#tx_rec.operations, none), bytes,
 	  [])];
 iolist(checkpoint_rec, Record) ->
@@ -229,9 +219,7 @@ decode(log_rec, Bytes) when is_binary(Bytes) ->
     Decoded = decode(Bytes, Types, Defaults),
     to_record(log_rec, Decoded);
 decode(tx_rec, Bytes) when is_binary(Bytes) ->
-    Types = [{6, operations, bytes, []},
-	     {5, crdt_type, crdt_type, []},
-	     {4, request_id, bytes, []}, {3, client_id, bytes, []},
+    Types = [{3, operations, bytes, []},
 	     {2, key, bytes, []}, {1, bucket, bytes, []}],
     Defaults = [],
     Decoded = decode(Bytes, Types, Defaults),
