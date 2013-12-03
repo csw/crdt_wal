@@ -80,8 +80,10 @@ update({remove, E},
 
 -spec sync(set(CRDT), term()) -> {'ok', set(CRDT)} |
                                  {'retry', set(CRDT)}.
-sync(S=#set{adds=[], rems=[]}, _Service) ->
-    {ok, S};
+sync(S=#set{adds=[], rems=[], mod=CMod, crdt=CRDT, cid=CID}, Service) ->
+    {ok, ResC, ResMAC} = crdt_service:fetch(Service, CID),
+    Merged = CMod:merge(CRDT, CMod:from_binary(ResC)),
+    {ok, S#set{crdt=Merged, mac=ResMAC}};
 sync(S=#set{adds=Adds, rems=Rems, cid=CID}, Service) ->
     Ops = ([ {passive_remove, E} || E <- Rems ]
            ++ [ {passive_add, E} || E <- Adds ]),
@@ -92,7 +94,7 @@ sync(S=#set{adds=Adds, rems=Rems, cid=CID}, Service) ->
                      end,
                      S,
                      Ops),
-    {ok, S3}.
+    {ok, S3#set{adds=[], rems=[]}}.
 
 sync_op(Op, S=#set{mod=CMod, crdt=CRDT, rid=RID, next_req=Req},
         Sender) ->
@@ -111,7 +113,7 @@ sync_op(Op, S=#set{mod=CMod, crdt=CRDT, rid=RID, next_req=Req},
             %% an appropriate remove operation, until the merge returns
             %% an identical CRDT.
 
-            Merged = CMod:merge(CRDT, ResC),
+            Merged = CMod:merge(CRDT, CMod:from_binary(ResC)),
             {ok, S#set{next_req=Req+1, crdt=Merged, mac=ResMAC}}
     end.
 
