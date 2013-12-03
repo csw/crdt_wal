@@ -1,0 +1,44 @@
+* Basic use
+** Setup
+#+BEGIN_SRC sh
+# may need this first:
+./rebar get-deps
+
+make
+mkdir /tmp/log_air
+#+END_SRC
+
+** Running tests
+: make test
+
+** Starting the service in a shell
+#+BEGIN_SRC sh
+erl -pz ebin deps/*/ebin -run crdt_wal -crdt_wal actor air -crdt_wal \
+    log_dir '"/tmp/log_air"' -crdt_wal data_dir '"/tmp/log_air"'
+#+END_SRC
+
+** Tinkering
+#+BEGIN_EXAMPLE
+crdt_service:create(crdt_service, "abc", logged_orswot).
+crdt_service:fetch(crdt_service, "abc").
+crdt_service:passive_op(crdt_service, "abc", {1,1}, {add, "ball bearings"}).
+
+crdt_service:create(crdt_service, "xyz", logged_orswot).
+crdt_service:passive_op(crdt_service, "xyz", {1,2}, {add, "cat carriers"}).
+
+crdt_service:passive_op(crdt_service, "abc", {1,3}, {add, "turnips"}).
+
+crdt_service:acknowledge(crdt_service, {1,1}).
+
+wal_mgr:take_checkpoint().
+wal_mgr:start_req_checkpoint().
+
+ets:i(outstanding_lsn).
+ets:i(requests).
+
+#+END_EXAMPLE
+
+* Development tasks
+
+** Adding to the PLT
+: $ dialyzer --plt .deps_plt --output_plt .deps_plt --add_to_plt --apps crypto
