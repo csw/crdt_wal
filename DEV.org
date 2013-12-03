@@ -68,6 +68,12 @@ crdt_service:passive_op(crdt_service, "keys", {99,2}, {add, "xyz"}).
 crdt_service:value(crdt_service, "keys").
 #+END_EXAMPLE
 
+*** Distributed
+
+#+BEGIN_EXAMPLE
+P1 = passive_set:fetch("abc", 100, nodes(), logged_orswot).
+#+END_EXAMPLE
+
 ** JSON
 
 #+BEGIN_EXAMPLE

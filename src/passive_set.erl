@@ -8,7 +8,7 @@
 
 -export_type([set/1]).
 
--export([new/4, value/1, value/2, update/2, sync/2]).
+-export([new/4, fetch/4, value/1, value/2, update/2, sync/1]).
 
 -type smod()         :: module().
 -type replica_id()   :: term().
@@ -18,22 +18,30 @@
 -type member()     :: term().
 -type set_op()     :: {'add', member()} | {'remove', member()}.
 
--record(set, {mod                  :: module(),
-              crdt                 :: term(),
-              cid                  :: term(),
-              rid                  :: replica_id(),
-              next_req=0           :: counter(),
-              mac=none             :: mac(),
-              adds=[]              :: ordsets:ordset(member()),
-              rems=[]              :: ordsets:ordset(member()),
-              pending=none         :: counter() | 'none',
-              pending_replica=none :: term() | 'none'
+-record(set, {mod                    :: module(),
+              crdt                   :: term(),
+              cid                    :: term(),
+              rid                    :: replica_id(),
+              next_req=0             :: counter(),
+              mac=none               :: mac(),
+              adds=[]                :: ordsets:ordset(member()),
+              rems=[]                :: ordsets:ordset(member()),
+              sources=[crdt_service] :: [term()],
+              pending=none           :: counter() | 'none',
+              pending_replica=none   :: term() | 'none'
              }).
--type set(CRDT)                    :: #set{crdt :: CRDT}.
+-type set(CRDT)                      :: #set{crdt :: CRDT}.
 
 -spec new(smod(), CRDT, term(), replica_id()) -> set(CRDT).
 new(Mod, CRDT, CID, RID) ->
     #set{mod=Mod, crdt=CRDT, cid=CID, rid=RID}.
+
+-spec fetch(string() | binary(), replica_id(), [term()], module()) -> #set{}.
+fetch(Key, Replica, NodesOrig, Mod) ->
+    Nodes = randomize_nodes(NodesOrig),
+    {ok, CBin, MAC} = crdt_service:fetch(hd(Nodes), Key),
+    #set{cid=Key, mod=Mod, crdt=Mod:from_binary(CBin), mac=MAC,
+         rid=Replica, sources=Nodes}.
 
 -spec value(set(_CRDT)) -> [member()].
 value(#set{mod=Mod, crdt=CRDT, adds=Adds, rems=Rems}) ->
@@ -78,16 +86,17 @@ update({remove, E},
 %%    (check clocks, not dot presence)
 %%
 
--spec sync(set(CRDT), term()) -> {'ok', set(CRDT)} |
-                                 {'retry', set(CRDT)}.
-sync(S=#set{adds=[], rems=[], mod=CMod, crdt=CRDT, cid=CID}, Service) ->
-    {ok, ResC, ResMAC} = crdt_service:fetch(Service, CID),
+-spec sync(set(CRDT)) -> {'ok', set(CRDT)} |
+                         {'retry', set(CRDT)}.
+sync(S=#set{adds=[], rems=[], mod=CMod, crdt=CRDT, cid=CID,
+            sources=[Source|_]}) ->
+    {ok, ResC, ResMAC} = crdt_service:fetch(Source, CID),
     Merged = CMod:merge(CRDT, CMod:from_binary(ResC)),
     {ok, S#set{crdt=Merged, mac=ResMAC}};
-sync(S=#set{adds=Adds, rems=Rems, cid=CID}, Service) ->
+sync(S=#set{adds=Adds, rems=Rems, cid=CID, sources=[Source|_]}) ->
     Ops = ([ {passive_remove, E} || E <- Rems ]
            ++ [ {passive_add, E} || E <- Adds ]),
-    Sender = crdt_service:send_passive_fun(Service, CID),
+    Sender = crdt_service:send_passive_fun(Source, CID),
     S3 = lists:foldl(fun(Op, S1) ->
                              {ok, S2} = sync_op(Op, S1, Sender),
                              S2
@@ -96,8 +105,7 @@ sync(S=#set{adds=Adds, rems=Rems, cid=CID}, Service) ->
                      Ops),
     {ok, S3#set{adds=[], rems=[]}}.
 
-sync_op(Op, S=#set{mod=CMod, crdt=CRDT, rid=RID, next_req=Req},
-        Sender) ->
+sync_op(Op, S=#set{mod=CMod, crdt=CRDT, rid=RID, next_req=Req}, Sender) ->
     case CMod:prepare(Op, nil, CRDT) of
         {ok, Prep, CRDT1} when CRDT == CRDT1 ->
             RequestID = {RID, Req},
@@ -116,6 +124,10 @@ sync_op(Op, S=#set{mod=CMod, crdt=CRDT, rid=RID, next_req=Req},
             Merged = CMod:merge(CRDT, CMod:from_binary(ResC)),
             {ok, S#set{next_req=Req+1, crdt=Merged, mac=ResMAC}}
     end.
+
+randomize_nodes(Nodes) ->
+    S = lists:keysort(1, [{random:uniform(), Node} || Node <- Nodes]),
+    [{crdt_service,Node} || {_, Node} <- S].
 
 -ifdef(TEST).
 
