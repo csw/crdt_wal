@@ -17,6 +17,23 @@ erl -pz ebin deps/*/ebin -run crdt_wal -crdt_wal actor air -crdt_wal \
     log_dir '"/tmp/log_air"' -crdt_wal data_dir '"/tmp/log_air"'
 #+END_SRC
 
+** Distributed
+
+#+BEGIN_SRC sh
+mkdir /tmp/argon /tmp/krypton
+
+erl -pz ebin deps/*/ebin -sname argon -run crdt_wal \
+    -crdt_wal log_dir '"/tmp/argon"' \
+    -crdt_wal data_dir '"/tmp/argon"'
+
+erl -pz ebin deps/*/ebin -sname krypton -run crdt_wal \
+    -crdt_wal log_dir '"/tmp/krypton"' \
+    -crdt_wal data_dir '"/tmp/krypton"'
+
+net_kernel:connect_node('argon@GSV-Full-Internal-Reflection').
+
+#+END_SRC
+
 ** Tinkering
 #+BEGIN_EXAMPLE
 crdt_service:create(crdt_service, "abc", logged_orswot).
