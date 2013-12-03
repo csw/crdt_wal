@@ -91,9 +91,10 @@ init([]) ->
 
 handle_call({log_durable, Key, Record}, _From, S=#state{lstate=LS}) ->
     LSN = wal:next_lsn(LS),
-    {ok, LS1} = wal:append(LS, #tx_rec{key=Key,
-                                       operations=term_to_binary(Record)}),
-    io:format("Appended log record ~16.16.0B.~n", [LSN]),
+    TxRec = #tx_rec{key=Key, operations=term_to_binary(Record)},
+    {Elapsed, {ok, LS1}} = timer:tc(fun() -> wal:append(LS, TxRec) end),
+    io:format("Appended log record ~16.16.0B in ~.3f ms~n",
+              [LSN, Elapsed/1000]),
     note_record(LSN, Record),
     {reply, {ok, LSN}, S#state{lstate=LS1}}.
 
@@ -194,7 +195,7 @@ note_record(LSN, OpRec) ->
 
 apply_log_record(#log_rec{lsn=LSN, tx=#tx_rec{key=Key, operations=OpsB}}) ->
     {ok, Pid} = crdt_service:find_recovery(Key),
-    io:format("LSN ~16.16.0B: CRDT ~w~n", [LSN, Key]),
+    io:format("LSN ~16.16.0B: CRDT ~p~n", [LSN, Key]),
     Op = binary_to_term(OpsB),
     ok = note_record(LSN, Op),
     ok = crdt_server:recover(Pid, LSN, Op),

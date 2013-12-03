@@ -140,7 +140,7 @@ fetch_server(Key, Mode, S=#state{s_table=ServerT}) ->
     end.
 
 start_server(Key, Mode, #state{actor=Actor, s_table=ServerT}) ->
-    io:format("Starting CRDT server in mode ~w, key=~w.~n",
+    io:format("Starting CRDT server in mode ~w, key=~p.~n",
               [Mode, Key]),
     case crdt_server_sup:add_server(Actor, Key, Mode) of
         {ok, Pid} ->

@@ -53,7 +53,7 @@ finish_recovery(Pid) ->
     gen_server:call(Pid, finish_recovery).
 
 forward(Pid, Request, From) ->
-    io:format("Forwarding request to ~p: ~p~n", [Pid, Request]),
+    %% io:format("Forwarding request to ~p: ~p~n", [Pid, Request]),
     gen_server:cast(Pid, {Request, From}),
     ok.
 
@@ -161,7 +161,7 @@ do_passive(RequestID, Op,
         unknown ->
             case Mod:prepare(Op, Actor, CRDT) of
                 {ok, Prep, _CPrep} ->
-                    io:format("Prepared op: ~p~n", [Prep]),
+                    %% io:format("Prepared op: ~p~n", [Prep]),
                     commit_record({passive_op, CID, RequestID, Prep}, S)
             end;
         State ->
@@ -205,8 +205,8 @@ stored(#state{cid=CID, mod=Mod, mac_key=Key, crdt=CRDT, lsn=LSN}) ->
     {CID, Mod, Key, Mod:to_binary(CRDT), LSN}.
 
 -spec ret_crdt(#state{}) -> {'ok', crdt_bin(), mac()}.
-ret_crdt(S=#state{mod=Mod, crdt=CRDT, mac_key=Key}) ->
-    io:format("Returning CRDT from state:~n~p~n", [S]),
+ret_crdt(#state{mod=Mod, crdt=CRDT, mac_key=Key}) ->
+    %% io:format("Returning CRDT from state:~n~p~n", [S]),
     CBin = Mod:to_binary(CRDT),
     MAC = crypto:sha_mac(Key, CBin),
     {ok, CBin, MAC}.
