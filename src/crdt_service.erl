@@ -5,7 +5,7 @@
 %% API
 -export([start_link/0, create/3, fetch/2,
          find_recovery/1, finish_recovery/0,
-         passive_op/4, acknowledge/2]).
+         send_passive_fun/2, passive_op/4, acknowledge/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -54,6 +54,11 @@ create(Service, Key, Mod) when is_atom(Mod) ->
                         crdt_state_reply().
 passive_op(Service, Key, RequestID, Op) ->
     gen_server:call(Service, {passive_op, bin_key(Key), RequestID, Op}).
+
+send_passive_fun(Service, Key) ->
+    fun(RequestID, Prepared) ->
+            passive_op(Service, Key, RequestID, Prepared)
+    end.
 
 acknowledge(Service, RequestID) ->
     gen_server:call(Service, {acknowledge, RequestID}).
