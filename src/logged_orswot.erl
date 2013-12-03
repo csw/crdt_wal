@@ -599,7 +599,6 @@ prep_add_test() ->
     {ok, S2} = effect(Prep1, Actor, Set),
     ?assert(value({contains, "moose"}, S2)),
     _Bin = to_binary(S2).
--endif.
 
 passive_add_test() ->
     Set = new(),
@@ -636,3 +635,5 @@ passive_remove_test() ->
     {ok, AS3} = effect(PrepA, active, S2),
     ?assertNot(value({contains, "moose"}, AS3)).
 
+
+-endif.
