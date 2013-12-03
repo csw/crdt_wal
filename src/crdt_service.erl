@@ -3,7 +3,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0, create/3, fetch/2,
+-export([start_link/0, create/3, fetch/2, value/2,
          find_recovery/1, finish_recovery/0,
          send_passive_fun/2, passive_op/4, acknowledge/2]).
 
@@ -48,6 +48,10 @@ finish_recovery() ->
 fetch(Service, Key) ->
     gen_server:call(Service, {fetch, bin_key(Key)}).
 
+-spec value(service(), key()) -> {'ok', term()} | {'error', term()}.
+value(Service, Key) ->
+    gen_server:call(Service, {value, bin_key(Key)}).
+
 -spec create(service(), key(), module()) -> crdt_state_reply().
 create(Service, Key, Mod) when is_atom(Mod) ->
     gen_server:call(Service, {create, bin_key(Key), Mod}).
@@ -85,6 +89,9 @@ handle_call({create, Key, Mod}, From, S=#state{mode=normal}) ->
 
 handle_call({fetch, Key}, From, S=#state{mode=normal}) ->
     forward_as(Key, normal, fetch, From, S);
+
+handle_call({value, Key}, From, S=#state{mode=normal}) ->
+    forward_as(Key, normal, value, From, S);
 
 handle_call({acknowledge, Request}, _From, S=#state{mode=normal}) ->
     ok = requests:acknowledge(Request),

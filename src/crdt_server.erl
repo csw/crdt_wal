@@ -112,6 +112,11 @@ handle_cast({fetch, From}, S=#state{mode=normal}) ->
     gen_server:reply(From, Reply),
     {noreply, S};
 
+handle_cast({value, From}, S=#state{mod=Mod, crdt=CRDT, mode=normal}) ->
+    Val = Mod:value(CRDT),
+    gen_server:reply(From, {ok, Val}),
+    {noreply, S};
+
 handle_cast({{recover, LSN, Rec}, From}, S0=#state{mode=recovery}) ->
     {ok, S} = apply_record(Rec, LSN, S0),
     gen_server:reply(From, ok),
