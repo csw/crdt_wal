@@ -3,8 +3,9 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/3, forward/3]).
--export([recover/3, finish_recovery/1, is_tracked_request/1]).
+-export([start_link/3, forward/3, send_replicate/2]).
+-export([recover/3, finish_recovery/1, is_tracked_request/1,
+         dump/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -23,7 +24,7 @@
 -type mac()        :: binary().
 
 -record(state, {cid         :: crdt_id(),
-                mode=normal :: 'normal' | 'recovery',
+                mode=normal :: 'normal' | 'recovery' | 'init_sync',
                 mod         :: module(),
                 actor       :: riak_dt:actor(),
                 mac_key     :: mac_key(),
@@ -57,6 +58,14 @@ forward(Pid, Request, From) ->
     gen_server:cast(Pid, {Request, From}),
     ok.
 
+-spec send_replicate(pid(), binary()) -> 'ok'.
+send_replicate(Pid, CBin) when is_pid(Pid), is_binary(CBin) ->
+    gen_server:cast(Pid, {replicate, CBin}).
+
+-spec dump(pid()) -> 'ok'.
+dump(Pid) when is_pid(Pid) ->
+    gen_server:cast(Pid, dump).
+
 -spec is_tracked_request(crdt_log_rec()) -> boolean().
 is_tracked_request(_) ->
     true.
@@ -80,6 +89,17 @@ init({Actor, CID, Mode}) when Mode == normal; Mode == recovery ->
             {ok, State#state{mode=Mode}};
         E={error, _Reason} ->
             E
+    end;
+
+init({Actor, CID, {sync, Mod}}) ->
+    case load_state(Actor, CID) of
+        {ok, State} ->
+            {ok, State#state{mode=normal}};
+        {error, _Reason} ->
+            Key = crypto:strong_rand_bytes(?MAC_KEY_LEN),
+            gen_server:cast(self(), sync_write),
+            {ok, #state{cid=CID, mod=Mod, actor=Actor, mac_key=Key,
+                        crdt=Mod:new(), mode=init_sync}}
     end.
 
 %% init({existing, Mod, CID}) ->
@@ -105,6 +125,7 @@ handle_cast({{passive_op, RequestID, Op}, From}, S0=#state{mode=normal}) ->
     {ok, S} = do_passive(RequestID, Op, S0),
     Reply = ret_crdt(S),
     gen_server:reply(From, Reply),
+    ok = replicate(S),
     {noreply, S};
 
 handle_cast({fetch, From}, S=#state{mode=normal}) ->
@@ -124,6 +145,16 @@ handle_cast({{recover, LSN, Rec}, From}, S0=#state{mode=recovery}) ->
 
 handle_cast(sync_write, S=#state{}) ->
     ok = storage:store_crdt_sync(stored(S)),
+    {noreply, S};
+
+handle_cast({replicate, CBin}, S=#state{mod=Mod, crdt=CRDT, mode=Mode})
+  when Mode == init_sync; Mode == normal ->
+    io:format("Received replication update, merging.~n"),
+    Merged = Mod:merge(CRDT, Mod:from_binary(CBin)),
+    {noreply, S#state{crdt=Merged, mode=normal}};
+
+handle_cast(dump, S=#state{cid=Key, crdt=CRDT}) ->
+    io:format("CRDT ~p: ~p~n", [Key, CRDT]),
     {noreply, S}.
 
 
@@ -170,6 +201,11 @@ do_passive(RequestID, Op,
                       [RequestID, State]),
             {ok, S}
     end.
+
+-spec replicate(#state{}) -> 'ok'.
+replicate(#state{cid=Key, mod=Mod, crdt=CRDT}) ->
+    abcast = crdt_service:request_replicate(Key, Mod, Mod:to_binary(CRDT)),
+    ok.
 
 -spec commit_record(crdt_log_rec(), #state{}) -> {'ok', #state{}}.
 commit_record(Record, S=#state{cid=CID}) ->

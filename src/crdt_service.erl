@@ -4,8 +4,8 @@
 
 %% API
 -export([start_link/0, create/3, fetch/2, value/2,
-         find_recovery/1, finish_recovery/0,
-         send_passive_fun/2, passive_op/4, acknowledge/2]).
+         find_recovery/1, finish_recovery/0, request_replicate/3,
+         send_passive_fun/2, passive_op/4, acknowledge/2, dump/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -62,20 +62,29 @@ passive_op(Service, Key, RequestID, Op) ->
     gen_server:call(Service, {passive_op, bin_key(Key), RequestID, Op}).
 
 send_passive_fun(Service, Key) ->
+    BinKey = bin_key(Key),
     fun(RequestID, Prepared) ->
-            passive_op(Service, Key, RequestID, Prepared)
+            passive_op(Service, BinKey, RequestID, Prepared)
     end.
 
 -spec acknowledge(service(), request_id()) -> 'ok'.
 acknowledge(Service, RequestID) ->
     gen_server:call(Service, {acknowledge, RequestID}).
 
+-spec request_replicate(key(), module(), binary()) -> 'abcast'.
+request_replicate(Key, Mod, CBin) ->
+    gen_server:abcast(nodes(), ?SERVER, {replicate, bin_key(Key), Mod, CBin}).
+
+-spec dump(key()) -> 'ok'.
+dump(Key) ->
+    gen_server:cast(?SERVER, {dump, bin_key(Key)}).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
 init([]) ->
-    {ok, Actor} = application:get_env(actor),
+    Actor = actor_name(),
     ServerT = ets:new(crdt_servers, []),
     {ok, Dir} = application:get_env(data_dir),
     ok = requests:init(Dir),
@@ -106,8 +115,19 @@ handle_call(finish_recovery, _From, S=#state{mode=recovery}) ->
     io:format("Recovery finished, CRDT service entering normal mode.~n"),
     {reply, ok, S#state{mode=normal}}.
 
+handle_cast({replicate, Key, Mod, CBin}, S=#state{mode=normal}) ->
+    {ok, Pid} = fetch_server(Key, {sync, Mod}, S),
+    ok = crdt_server:send_replicate(Pid, CBin),
+    {noreply, S};
+
+handle_cast({dump, Key}, S=#state{mode=Mode}) ->
+    {ok, Pid} = fetch_server(Key, Mode, S),
+    ok = crdt_server:dump(Pid),
+    {noreply, S};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
 
 handle_info(_Msg, State) ->
     {noreply, State}.
@@ -165,3 +185,17 @@ bin_key(Key) when is_binary(Key) ->
     Key;
 bin_key(Key) when is_list(Key) ->
     list_to_binary(Key).
+
+actor_name() ->
+    case application:get_env(actor) of
+        {ok, Actor} ->
+            Actor;
+        _ ->
+            case node() of
+                'nonode@nohost' ->
+                    {ok, Name} = inet:gethostname(),
+                    list_to_binary(Name);
+                Nodename ->
+                    Nodename
+            end
+    end.
