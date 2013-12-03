@@ -78,19 +78,13 @@ init([]) ->
     {ok, #state{actor=Actor, s_table=ServerT}}.
 
 handle_call({passive_op, Key, RequestID, Op}, From, S=#state{mode=normal}) ->
-    {ok, Pid} = fetch_server(Key, normal, S),
-    ok = crdt_server:forward(Pid, {passive_op, RequestID, Op}, From),
-    {noreply, S};
+    forward_as(Key, normal, {passive_op, RequestID, Op}, From, S);
 
 handle_call({create, Key, Mod}, From, S=#state{mode=normal}) ->
-    {ok, Pid} = fetch_server(Key, {new, Mod}, S),
-    ok = crdt_server:forward(Pid, fetch, From),
-    {noreply, S};
+    forward_as(Key, {new, Mod}, fetch, From, S);
 
 handle_call({fetch, Key}, From, S=#state{mode=normal}) ->
-    {ok, Pid} = fetch_server(Key, normal, S),
-    ok = crdt_server:forward(Pid, fetch, From),
-    {noreply, S};
+    forward_as(Key, normal, fetch, From, S);
 
 handle_call({acknowledge, Request}, _From, S=#state{mode=normal}) ->
     ok = requests:acknowledge(Request),
@@ -121,19 +115,34 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+forward_as(Key, Mode, Req, From, S) ->
+    case fetch_server(Key, Mode, S) of
+        {ok, Pid} ->
+            ok = crdt_server:forward(Pid, Req, From),
+            {noreply, S};
+        {error, {bad_return_value, {error, Reason}}} ->
+            {reply, {error, Reason}, S};
+        R={error, _Reason} ->
+            {reply, R, S}
+    end.
+
 fetch_server(Key, Mode, S=#state{s_table=ServerT}) ->
     case ets:lookup(ServerT, Key) of
-        []    -> start_server(Key, Mode, S);
+        []          -> start_server(Key, Mode, S);
         [{Key,Pid}] -> {ok, Pid}
     end.
 
 start_server(Key, Mode, #state{actor=Actor, s_table=ServerT}) ->
     io:format("Starting CRDT server in mode ~w, key=~w.~n",
               [Mode, Key]),
-    {ok, Pid} = crdt_server_sup:add_server(Actor, Key, Mode),
-    %% TODO: monitor?
-    true = ets:insert(ServerT, {Key, Pid}),
-    {ok, Pid}.
+    case crdt_server_sup:add_server(Actor, Key, Mode) of
+        {ok, Pid} ->
+            %% TODO: monitor?
+            true = ets:insert(ServerT, {Key, Pid}),
+            {ok, Pid};
+        R={error, _} ->
+            R
+    end.
     
 finish_recovery(#state{s_table=ServerT}) ->
     _Total =

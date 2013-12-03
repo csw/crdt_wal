@@ -74,14 +74,13 @@ init({Actor, CID, {new, Mod}}) ->
     {ok, #state{cid=CID, mod=Mod, actor=Actor, mac_key=Key,
                 crdt=Mod:new()}};
 
-init({Actor, CID, recovery}) ->
-    {ok, State} = load_state(Actor, CID),
-    {ok, State#state{mode=recovery}};
-
-init({Actor, CID, normal}) ->
-    {ok, State} = load_state(Actor, CID),
-    {ok, State#state{mode=normal}}.
-
+init({Actor, CID, Mode}) when Mode == normal; Mode == recovery ->
+    case load_state(Actor, CID) of
+        {ok, State} ->
+            {ok, State#state{mode=Mode}};
+        E={error, _Reason} ->
+            E
+    end.
 
 %% init({existing, Mod, CID}) ->
 %%     {ok, #state{}}.
@@ -136,12 +135,17 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
--spec load_state(riak_dt:actor(), crdt_id()) -> {'ok', #state{}}.
+-spec load_state(riak_dt:actor(), crdt_id()) -> {'ok', #state{}} |
+                                                {'error', term()}.
 load_state(Actor, CID) ->
-    {ok, {CID, Mod, MACKey, CBin, LSN}} = storage:load_crdt(CID),
-    CRDT = Mod:from_binary(CBin),
-    {ok, #state{cid=CID, mod=Mod, actor=Actor, mac_key=MACKey,
-                crdt=CRDT, lsn=LSN}}.
+    case storage:load_crdt(CID) of
+        {ok, {CID, Mod, MACKey, CBin, LSN}} ->
+            CRDT = Mod:from_binary(CBin),
+            {ok, #state{cid=CID, mod=Mod, actor=Actor, mac_key=MACKey,
+                        crdt=CRDT, lsn=LSN}};
+        R={error, not_found} ->
+            R
+    end.
 
 -spec do_passive(crdt_service:request_id(), crdt_service:crdt_op(),
                  #state{}) ->
