@@ -5,7 +5,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0, log_durable/2, clean_record/2]).
+-export([start_link/0, log/3, clean_record/2]).
 -export([take_checkpoint/0, start_req_checkpoint/0]).
 
 %% gen_server callbacks
@@ -27,10 +27,11 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
--spec log_durable(crdt_server:crdt_id(), crdt_server:crdt_log_rec()) ->
-                         {'ok', wal:lsn()}.
-log_durable(Key, Record) ->
-    gen_server:call(?SERVER, {log_durable, Key, Record}).
+-spec log(crdt_server:crdt_id(),
+          crdt_server:crdt_log_rec(),
+          'sync' | 'nosync') -> {'ok', wal:lsn()}.
+log(Key, Record, Mode) ->
+    gen_server:call(?SERVER, {log_append, Key, Record, Mode}).
 
 %% For marking log records as clean
 
@@ -89,10 +90,11 @@ init([]) ->
                              gen_server, cast, [self(), take_checkpoint]),
     {ok, State}.
 
-handle_call({log_durable, Key, Record}, _From, S=#state{lstate=LS}) ->
+handle_call({log_append, Key, Record, Mode}, _From, S=#state{lstate=LS}) ->
     LSN = wal:next_lsn(LS),
     TxRec = #tx_rec{key=Key, operations=term_to_binary(Record)},
-    {Elapsed, {ok, LS1}} = timer:tc(fun() -> wal:append(LS, TxRec) end),
+    {Elapsed, {ok, LS1}} =
+        timer:tc(fun() -> wal:append(LS, TxRec, Mode) end),
     io:format("Appended log record ~16.16.0B in ~.3f ms~n",
               [LSN, Elapsed/1000]),
     note_record(LSN, Record),
@@ -183,13 +185,10 @@ recover_from(Log, StartLSN, PosMode) ->
 
 -spec note_record(wal:lsn(), crdt_server:crdt_log_rec()) -> 'ok'.
 note_record(LSN, OpRec) ->
-    true = ets:insert_new(?TABLE, {{LSN,data}}),
-    case crdt_server:is_tracked_request(OpRec) of
-        true ->
-            true = ets:insert_new(?TABLE, {{LSN,request}});
-        false ->
-            ok
-    end,
+    lists:foreach(fun(Expect) ->
+                          true = ets:insert_new(?TABLE, {{LSN, Expect}})
+                  end,
+                  crdt_server:track_record_by(OpRec)),
     ok.
             
 

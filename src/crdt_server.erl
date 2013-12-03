@@ -4,7 +4,7 @@
 
 %% API
 -export([start_link/3, forward/3, send_replicate/2]).
--export([recover/3, finish_recovery/1, is_tracked_request/1,
+-export([recover/3, finish_recovery/1, track_record_by/1,
          dump/1]).
 
 %% gen_server callbacks
@@ -35,7 +35,8 @@
 -type crdt_log_rec() :: {'passive_op',
                          crdt_id(),
                          crdt_service:request_id(),
-                         crdt_op()}.
+                         crdt_op()} |
+                        {'merge', binary()}.
 
 %%%===================================================================
 %%% API
@@ -66,9 +67,12 @@ send_replicate(Pid, CBin) when is_pid(Pid), is_binary(CBin) ->
 dump(Pid) when is_pid(Pid) ->
     gen_server:cast(Pid, dump).
 
--spec is_tracked_request(crdt_log_rec()) -> boolean().
-is_tracked_request(_) ->
-    true.
+-spec track_record_by(crdt_log_rec()) -> ['data' | 'request'].
+track_record_by({passive_op, _, _, _}) ->
+    [data, request];
+track_record_by({merge, _}) ->
+    [data].
+
 
 %% start_existing(Mod, CID) ->
 %%     gen_server:start_link({local, ?SERVER}, ?MODULE, {existing, Mod, CID}, []).
@@ -150,8 +154,8 @@ handle_cast(sync_write, S=#state{}) ->
 handle_cast({replicate, CBin}, S=#state{mod=Mod, crdt=CRDT, mode=Mode})
   when Mode == init_sync; Mode == normal ->
     io:format("Received replication update, merging.~n"),
-    Merged = Mod:merge(CRDT, Mod:from_binary(CBin)),
-    {noreply, S#state{crdt=Merged, mode=normal}};
+    {ok, MS} = commit_record({merge, CBin}, S),
+    {noreply, MS};
 
 handle_cast(dump, S=#state{cid=Key, crdt=CRDT}) ->
     io:format("CRDT ~p: ~p~n", [Key, CRDT]),
@@ -209,8 +213,13 @@ replicate(#state{cid=Key, mod=Mod, crdt=CRDT}) ->
 
 -spec commit_record(crdt_log_rec(), #state{}) -> {'ok', #state{}}.
 commit_record(Record, S=#state{cid=CID}) ->
-    {ok, LSN} = wal_mgr:log_durable(CID, Record),
+    {ok, LSN} = wal_mgr:log(CID, Record, wal_mode(Record)),
     apply_record(Record, LSN, S).
+
+wal_mode({passive_op, _, _, _}) ->
+    sync;
+wal_mode({merge, _}) ->
+    nosync.
 
 -spec apply_record(crdt_log_rec(), wal:lsn(), #state{}) -> {'ok', #state{}}.
 apply_record({passive_op, CID, RequestID, Prep}=Op,
@@ -226,16 +235,22 @@ apply_record({passive_op, CID, RequestID, Prep}=Op,
     ok = wal_mgr:clean_record(OpLSN, data),
     {ok, S1};
 
-apply_record({passive_op, _, RequestID, _}, OpLSN, S=#state{lsn=LSN}) ->
+apply_record({passive_op, _, RequestID, _}, OpLSN, S=#state{lsn=LSN})
+  when OpLSN =< LSN ->
     ok = requests:committed(RequestID, OpLSN),
     ok = wal_mgr:clean_record(OpLSN, data),
     io:format("Skipping log record ~16.16.0B, already at ~16.16.0B.~n",
               [OpLSN, LSN]),
     {ok, S};
 
-apply_record(_Op, _OpLSN, S=#state{}) ->
-    %% before the current LSN, skip it
-    {ok, S}.
+apply_record({merge, CBin}, OpLSN,
+             S=#state{mod=Mod, crdt=CRDT, lsn=LSN})
+  when LSN == none orelse OpLSN > LSN ->
+    Merged = Mod:merge(CRDT, Mod:from_binary(CBin)),
+    S1 = S#state{crdt=Merged, lsn=LSN},
+    ok = storage:store_crdt(stored(S1)),
+    ok = wal_mgr:clean_record(OpLSN, data),
+    {ok, S1}.
 
 stored(#state{cid=CID, mod=Mod, mac_key=Key, crdt=CRDT, lsn=LSN}) ->
     {CID, Mod, Key, Mod:to_binary(CRDT), LSN}.

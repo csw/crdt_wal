@@ -8,7 +8,7 @@
 -include("wal_pb.hrl").
 
 -export([create_log/2, open_log/2, close_log/1, log_info/1,
-         append/2, read_log_from/3, start_lsn/1, next_lsn/1,
+         append/3, read_log_from/3, start_lsn/1, next_lsn/1,
          open_dir/1, init_dir/1, take_checkpoint/2]).
 -export([parse_lsn/1, parse_ckpt_path/1]).
 -export_type([lsn/0, log_state/0]).
@@ -197,15 +197,20 @@ close_log(#log_state{iodev=IODev}) ->
     ok = file:close(IODev),
     ok.
 
--spec append(#log_state{mode :: 'append'}, #tx_rec{})
+-spec append(#log_state{mode :: 'append'}, #tx_rec{}, 'sync' | 'nosync')
             -> {'ok', #log_state{mode :: 'append'}}.
 
 append(St=#log_state{mode=append, iodev=IODev, next_lsn=NextLSN},
-       TXRec=#tx_rec{}) ->
+       TXRec=#tx_rec{}, Sync) when Sync == sync; Sync == nosync ->
     LogRec = build_record(TXRec, NextLSN),
     {ok, Data, RecSize} = encode_framed(LogRec, ?LOG_ALIGN),
     ok = file:write(IODev, Data),
-    ok = file:sync(IODev),
+    case Sync of
+        sync ->
+            ok = file:sync(IODev);
+        nosync ->
+            ok
+    end,
     LSNDelta = RecSize div ?LOG_ALIGN,
     {ok, St#log_state{next_lsn=NextLSN + LSNDelta}}.
 
