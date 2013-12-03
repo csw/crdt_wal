@@ -6,6 +6,7 @@
   {applications, [
                   kernel,
                   stdlib,
+                  crypto,
                   riak_dt
                  ]},
   {mod, { crdt_wal_app, []}},
