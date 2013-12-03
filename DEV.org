@@ -30,15 +30,54 @@ crdt_service:passive_op(crdt_service, "abc", {1,3}, {add, "turnips"}).
 
 crdt_service:acknowledge(crdt_service, {1,1}).
 
+crdt_service:passive_op(crdt_service, "abc", {1,4}, {add, "coffee cups"}).
+crdt_service:passive_op(crdt_service, "abc", {1,5}, {add, "parsnips"}).
+crdt_service:passive_op(crdt_service, "abc", {1,6}, {add, "parsley"}).
+crdt_service:passive_op(crdt_service, "abc", {1,7}, {add, "compasses"}).
+crdt_service:passive_op(crdt_service, "abc", {1,8}, {add, "dividers"}).
+crdt_service:passive_op(crdt_service, "abc", {1,9}, {add, "erasers"}).
+
 wal_mgr:take_checkpoint().
 wal_mgr:start_req_checkpoint().
 
 ets:i(outstanding_lsn).
 ets:i(requests).
+#+END_EXAMPLE
 
+#+BEGIN_EXAMPLE
+crdt_service:create(crdt_service, "keys", logged_orswot).
+crdt_service:passive_op(crdt_service, "keys", {99,1}, {add, "abc"}).
+crdt_service:passive_op(crdt_service, "keys", {99,2}, {add, "xyz"}).
+crdt_service:value(crdt_service, "keys").
+#+END_EXAMPLE
+
+** JSON
+
+#+BEGIN_EXAMPLE
+{ok, CBin, _} = crdt_service:fetch(crdt_service, "abc").
+C1 = logged_orswot:from_binary(CBin).
+jiffy:encode(C1).
+** exception throw: {error,invalid_ejson}
+     in function  jiffy:encode/2 (src/jiffy.erl, line 34)
 #+END_EXAMPLE
 
 * Development tasks
 
 ** Adding to the PLT
 : $ dialyzer --plt .deps_plt --output_plt .deps_plt --add_to_plt --apps crypto
+
+* Performance
+
+** log writes
+
+: 
+
+#+BEGIN_EXAMPLE
+ ELAPSD SYSCALL(args) 		 = return
+     17 select(0x4, 0x160AC1F4, 0x160AC2F4, 0x0, 0x16C0E7D8)		 = 0 0
+     25 writev(0xC, 0x7F9AC10E4250, 0x3)		 = 128 0
+   7170 fcntl(0xC, 0x33, 0x9)		 = 0 0
+     15 write_nocancel(0x0, "Appended log record 0000000000000014 in 7.334 ms\r\n\0", 0x32)		 = 50 0
+#+END_EXAMPLE
+
+On OS X, uses =F_FULLSYNC= fcntl.
