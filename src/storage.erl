@@ -42,7 +42,14 @@ load_crdt(Key) ->
 %%%===================================================================
 
 init([]) ->
-    {ok, _Table} = dets:open_file(?TABLE, []),
+    Filename = atom_to_list(?TABLE) ++ ".dets",
+    Path = case application:get_env(data_dir) of
+               {ok, Dir} ->
+                   filename:join(Dir, Filename);
+               _ ->
+                   Filename
+           end,
+    {ok, _Table} = dets:open_file(?TABLE, [{file, Path}]),
     {ok, {}}.
 
 handle_call({store_crdt, Entry}, _From, {}) ->
