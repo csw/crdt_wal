@@ -5,14 +5,13 @@
 %%
 %% For maintaining a (roughly) ARIES-style transaction log on disk.
 
--include_lib("kernel/include/file.hrl").
 -include("wal_pb.hrl").
 
 -export([create_log/2, open_log/2, close_log/1, log_info/1,
          append/2, read_log_from/3, start_lsn/1, next_lsn/1,
-         open_dir/1, init_dir/1]).
+         open_dir/1, init_dir/1, take_checkpoint/2]).
 -export([parse_lsn/1, parse_ckpt_path/1]).
--export_type([lsn/0]).
+-export_type([lsn/0, log_state/0]).
 
 -define(LOG_MAGIC, <<16#BF, 16#9A, 16#02, 16#C7, "CRDT">>).
 -define(CKPT_MAGIC, <<16#BF, 16#9A, 16#02, 16#C7, "CKPT">>).
@@ -22,14 +21,16 @@
 -define(VERSION, 1).
 
 -type lsn() :: non_neg_integer().
--type checkpoint_num () :: non_neg_integer().
+-type checkpoint_num() :: non_neg_integer().
 
--record(log_state, {dir       :: file:name_all(),
-                    file      :: file:name_all(),
+-record(log_state, {dir       :: file:filename(),
+                    file      :: file:filename(),
                     iodev     :: file:io_device(),
                     mode      :: 'append' | 'read',
                     start_lsn :: lsn(),
                     next_lsn  :: lsn()}).
+
+-type log_state() :: #log_state{}.
 
 %% Log file layout:
 %%     0: magic, 8 bytes
@@ -80,8 +81,8 @@ open_dir(Dir) ->
     end.
     
 
--spec init_dir(file:name_all()) ->
-                      {'ok', file:name_all(), lsn(), file:name_all() }.
+-spec init_dir(file:filename()) ->
+                      {'ok', file:filename(), lsn(), checkpoint_num() }.
 init_dir(Dir) ->
     [] = list_logs(Dir),
     StartLSN = 0,
@@ -90,8 +91,8 @@ init_dir(Dir) ->
     {ok, _CPF} = write_checkpoint(Dir, {checkpoint, Checkpoint, StartLSN}),
     {ok, Log, StartLSN, Checkpoint}.
 
--spec create_log(file:name_all(), non_neg_integer())
-                -> {'ok', file:name_all()}.
+-spec create_log(file:filename(), non_neg_integer())
+                -> {'ok', file:filename()}.
 
 create_log(Dir, StartLSN) ->
     Path = log_path(Dir, StartLSN),
@@ -107,7 +108,8 @@ find_logs_for_lsn(Dir, TargetLSN) ->
                         list_logs(Dir)),
     case lists:sort(After) of
         [] ->
-            {error, past_end};
+            {_LSN, BPath} = lists:max(Before),
+            {ok, [BPath]};
         [{TargetLSN, _Path}|_LS]=AfterS ->
             %% exact match
             {ok, [Path || {_LSN, Path} <- AfterS]};
@@ -134,6 +136,11 @@ parse_lsn(Path) ->
 parse_ckpt_path(Path) ->
     {ok, [CNum], []} = io_lib:fread("c_~16u.ckpt", filename:basename(Path)),
     {CNum, Path}.
+
+-spec take_checkpoint({checkpoint_num(), lsn()}, log_state()) ->
+                             {'ok', file:filename()}.
+take_checkpoint({Num, LSN}, #log_state{dir=Dir}) ->
+    write_checkpoint(Dir, {checkpoint, Num, LSN}).
 
 write_checkpoint(Dir, {checkpoint, Num, LSN}) ->
     Path = checkpoint_path(Dir, Num),
@@ -166,7 +173,7 @@ log_info(Path) ->
     ok = close_log(LS),
     ok.
 
--spec open_log(file:name_all(), 'append' | 'read') -> {'ok', #log_state{}}.
+-spec open_log(file:filename(), 'append' | 'read') -> {'ok', #log_state{}}.
 
 open_log(Path, Mode) ->
     {ok, IODev} = file:open(Path,

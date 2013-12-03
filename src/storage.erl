@@ -13,7 +13,8 @@
 -type stored_crdt() :: {crdt_server:crdt_id(),
                         module(),
                         crdt_server:mac_key(),
-                        crdt_server:crdt_bin()}.
+                        crdt_server:crdt_bin(),
+                        wal:lsn()}.
 
 
 -define(TABLE, crdt).

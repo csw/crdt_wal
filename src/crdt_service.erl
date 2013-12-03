@@ -11,7 +11,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--define(SERVER, ?MODULE).
+-export_type([request_id/0, crdt_op/0]).
 
 -type key()        :: crdt_server:crdt_id().
 -type service()    :: module() | pid().
@@ -27,6 +27,8 @@
                 s_table       :: ets:tid(),
                 mode=recovery :: 'recovery' | 'normal'
                }).
+
+-define(SERVER, ?MODULE).
 
 %%%===================================================================
 %%% API
@@ -60,6 +62,7 @@ send_passive_fun(Service, Key) ->
             passive_op(Service, Key, RequestID, Prepared)
     end.
 
+-spec acknowledge(service(), request_id()) -> 'ok'.
 acknowledge(Service, RequestID) ->
     gen_server:call(Service, {acknowledge, RequestID}).
 
@@ -70,7 +73,8 @@ acknowledge(Service, RequestID) ->
 init([]) ->
     {ok, Actor} = application:get_env(actor),
     ServerT = ets:new(crdt_servers, []),
-    ok = requests:init(),
+    {ok, Dir} = application:get_env(data_dir),
+    ok = requests:init(Dir),
     {ok, #state{actor=Actor, s_table=ServerT}}.
 
 handle_call({passive_op, Key, RequestID, Op}, From, S=#state{mode=normal}) ->
@@ -89,7 +93,7 @@ handle_call({fetch, Key}, From, S=#state{mode=normal}) ->
     {noreply, S};
 
 handle_call({acknowledge, Request}, _From, S=#state{mode=normal}) ->
-    ok = requests:track(Request, acknowledged),
+    ok = requests:acknowledge(Request),
     {reply, ok, S};
 
 handle_call({find_recovery, Key}, _From, S=#state{mode=recovery}) ->
@@ -124,7 +128,7 @@ fetch_server(Key, Mode, S=#state{s_table=ServerT}) ->
     end.
 
 start_server(Key, Mode, #state{actor=Actor, s_table=ServerT}) ->
-    io:format("Starting CRDT server in mode ~w, key=~w~n",
+    io:format("Starting CRDT server in mode ~w, key=~w.~n",
               [Mode, Key]),
     {ok, Pid} = crdt_server_sup:add_server(Actor, Key, Mode),
     %% TODO: monitor?

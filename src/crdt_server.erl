@@ -4,19 +4,19 @@
 
 %% API
 -export([start_link/3, forward/3]).
--export([recover/3, finish_recovery/1]).
+-export([recover/3, finish_recovery/1, is_tracked_request/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
--export_type([crdt_id/0, crdt_bin/0, mac_key/0, mac/0]).
+-export_type([crdt_id/0, crdt_bin/0, mac_key/0, mac/0,
+              crdt_log_rec/0]).
 
 -define(SERVER, ?MODULE).
 
 -define(MAC_KEY_LEN, 20). % SHA-1
 
 -type crdt_id()    :: binary().
--type request_id() :: term().
 -type crdt_op()    :: term().
 -type crdt_bin()   :: binary().
 -type mac_key()    :: binary().
@@ -27,17 +27,21 @@
                 mod         :: module(),
                 actor       :: riak_dt:actor(),
                 mac_key     :: mac_key(),
-                crdt=none   :: riak_dt:crdt() | 'none'
+                crdt=none   :: riak_dt:crdt() | 'none',
+                lsn=none    :: wal:lsn() | 'none'
                }).
 
--type crdt_log_rec() :: {'passive_op', crdt_id(), request_id(), crdt_op()}.
+-type crdt_log_rec() :: {'passive_op',
+                         crdt_id(),
+                         crdt_service:request_id(),
+                         crdt_op()}.
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
 start_link(Actor, Key, Mode) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE,
+    gen_server:start_link(?MODULE,
                           {Actor, Key, Mode},
                           []).
 
@@ -49,8 +53,13 @@ finish_recovery(Pid) ->
     gen_server:call(Pid, finish_recovery).
 
 forward(Pid, Request, From) ->
+    io:format("Forwarding request to ~p: ~p~n", [Pid, Request]),
     gen_server:cast(Pid, {Request, From}),
     ok.
+
+-spec is_tracked_request(crdt_log_rec()) -> boolean().
+is_tracked_request(_) ->
+    true.
 
 %% start_existing(Mod, CID) ->
 %%     gen_server:start_link({local, ?SERVER}, ?MODULE, {existing, Mod, CID}, []).
@@ -66,16 +75,12 @@ init({Actor, CID, {new, Mod}}) ->
                 crdt=Mod:new()}};
 
 init({Actor, CID, recovery}) ->
-    {ok, {CID, Mod, MACKey, CBin}} = storage:load_crdt(CID),
-    CRDT = Mod:from_binary(CBin),
-    {ok, #state{cid=CID, mod=Mod, actor=Actor, mac_key=MACKey,
-                crdt=CRDT, mode=recovery}};
+    {ok, State} = load_state(Actor, CID),
+    {ok, State#state{mode=recovery}};
 
 init({Actor, CID, normal}) ->
-    {ok, {CID, Mod, MACKey, CBin}} = storage:load_crdt(CID),
-    CRDT = Mod:from_binary(CBin),
-    {ok, #state{cid=CID, mod=Mod, actor=Actor, mac_key=MACKey,
-                crdt=CRDT, mode=normal}}.
+    {ok, State} = load_state(Actor, CID),
+    {ok, State#state{mode=normal}}.
 
 
 %% init({existing, Mod, CID}) ->
@@ -131,17 +136,29 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
--spec do_passive(request_id(), term(), #state{}) -> {'ok', #state{}}.
+-spec load_state(riak_dt:actor(), crdt_id()) -> {'ok', #state{}}.
+load_state(Actor, CID) ->
+    {ok, {CID, Mod, MACKey, CBin, LSN}} = storage:load_crdt(CID),
+    CRDT = Mod:from_binary(CBin),
+    {ok, #state{cid=CID, mod=Mod, actor=Actor, mac_key=MACKey,
+                crdt=CRDT, lsn=LSN}}.
+
+-spec do_passive(crdt_service:request_id(), crdt_service:crdt_op(),
+                 #state{}) ->
+                        {'ok', #state{}}.
 do_passive(RequestID, Op,
            S=#state{cid=CID, mod=Mod, actor=Actor, crdt=CRDT}) ->
     case requests:check(RequestID) of
         unknown ->
             case Mod:prepare(Op, Actor, CRDT) of
                 {ok, Prep, _CPrep} ->
+                    io:format("Prepared op: ~p~n", [Prep]),
                     commit_record({passive_op, CID, RequestID, Prep}, S)
             end;
-        committed ->
+        State ->
             %% Duplicate request, do nothing
+            io:format("Ignoring duplicate request ~p, state=~p.~n",
+                      [RequestID, State]),
             {ok, S}
     end.
 
@@ -152,18 +169,31 @@ commit_record(Record, S=#state{cid=CID}) ->
 
 -spec apply_record(crdt_log_rec(), wal:lsn(), #state{}) -> {'ok', #state{}}.
 apply_record({passive_op, CID, RequestID, Prep}=Op,
-             LSN,
-             S=#state{mod=Mod, actor=Actor, crdt=CRDT}) ->
+             OpLSN,
+             S=#state{mod=Mod, actor=Actor, crdt=CRDT, lsn=LSN})
+  when LSN == none orelse OpLSN > LSN ->
     io:format("Applying log record ~16.16.0B to CRDT ~p:~n~p~n",
-             [LSN, CID, Op]),
+             [OpLSN, CID, Op]),
     {ok, CEff} = Mod:effect(Prep, Actor, CRDT),
-    S1 = S#state{crdt=CEff},
-    ok = requests:track(RequestID, committed),
+    S1 = S#state{crdt=CEff, lsn=OpLSN},
+    ok = requests:committed(RequestID, OpLSN),
     ok = storage:store_crdt(stored(S1)),
-    {ok, S1}.
+    ok = wal_mgr:clean_record(OpLSN, data),
+    {ok, S1};
 
-stored(#state{cid=CID, mod=Mod, mac_key=Key, crdt=CRDT}) ->
-    {CID, Mod, Key, Mod:to_binary(CRDT)}.
+apply_record({passive_op, _, RequestID, _}, OpLSN, S=#state{lsn=LSN}) ->
+    ok = requests:committed(RequestID, OpLSN),
+    ok = wal_mgr:clean_record(OpLSN, data),
+    io:format("Skipping log record ~16.16.0B, already at ~16.16.0B.~n",
+              [OpLSN, LSN]),
+    {ok, S};
+
+apply_record(_Op, _OpLSN, S=#state{}) ->
+    %% before the current LSN, skip it
+    {ok, S}.
+
+stored(#state{cid=CID, mod=Mod, mac_key=Key, crdt=CRDT, lsn=LSN}) ->
+    {CID, Mod, Key, Mod:to_binary(CRDT), LSN}.
 
 -spec ret_crdt(#state{}) -> {'ok', crdt_bin(), mac()}.
 ret_crdt(S=#state{mod=Mod, crdt=CRDT, mac_key=Key}) ->
