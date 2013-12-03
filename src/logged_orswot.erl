@@ -205,7 +205,7 @@ effect(Op={add_at, Elem, Dot}, Actor, Set={Clock, Entries}) ->
             {ok, {riak_dt_vclock:increment(Actor, Clock),
                   update_entry(Elem, Entries, [Dot])}};
         duplicate ->
-            Set
+            {ok, Set}
     end;
 effect(Op={remove_versions, Elem, RmDots}, Actor, Set={Clock, Entries}) ->
     case check_precondition(Op, Actor, Set) of
