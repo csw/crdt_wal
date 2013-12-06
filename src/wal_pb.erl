@@ -92,7 +92,7 @@ iolist(log_header, Record) ->
 	  [])];
 iolist(log_rec, Record) ->
     [pack(1, required,
-	  with_default(Record#log_rec.lsn, none), uint64, []),
+	  with_default(Record#log_rec.lsn, none), fixed64, []),
      pack(2, required,
 	  with_default(Record#log_rec.tstamp, none), int64, []),
      pack(3, optional, with_default(Record#log_rec.tx, none),
@@ -214,7 +214,7 @@ decode(log_header, Bytes) when is_binary(Bytes) ->
     to_record(log_header, Decoded);
 decode(log_rec, Bytes) when is_binary(Bytes) ->
     Types = [{3, tx, tx_rec, [is_record]},
-	     {2, tstamp, int64, []}, {1, lsn, uint64, []}],
+	     {2, tstamp, int64, []}, {1, lsn, fixed64, []}],
     Defaults = [],
     Decoded = decode(Bytes, Types, Defaults),
     to_record(log_rec, Decoded);

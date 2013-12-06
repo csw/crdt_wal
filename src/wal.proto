@@ -4,7 +4,7 @@ message Log_Header {
 }
 
 message Log_Rec {
-    required uint64         lsn = 1;
+    required fixed64        lsn = 1;
     required int64          tstamp = 2;
     optional Tx_Rec         tx = 3;
 }
