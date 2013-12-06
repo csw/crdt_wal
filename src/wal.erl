@@ -7,6 +7,10 @@
 
 -include("wal_pb.hrl").
 
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
 -export([create_log/2, open_log/2, close_log/1, log_info/1,
          append/3, read_log_from/3, start_lsn/1, next_lsn/1,
          open_dir/1, init_dir/1, take_checkpoint/2]).
@@ -181,15 +185,19 @@ open_log(Path, Mode) ->
                                 append -> [read, write, append, binary, raw];
                                 read   -> [read, binary, raw, read_ahead]
                             end),
-    {ok, #log_header{start_lsn=StartLSN}} = read_log_header(IODev),
-    {ok, EndPos} = file:position(IODev, eof),
-    NextLSN = offset_to_lsn(StartLSN, EndPos),
-    {ok, #log_state{dir=filename:dirname(Path),
-                    file=Path,
-                    iodev=IODev,
-                    mode=Mode,
-                    start_lsn=StartLSN,
-                    next_lsn=NextLSN}}.
+    case read_log_header(IODev) of
+        {ok, #log_header{start_lsn=StartLSN}} ->
+            {ok, EndPos} = file:position(IODev, eof),
+            NextLSN = offset_to_lsn(StartLSN, EndPos),
+            {ok, #log_state{dir=filename:dirname(Path),
+                            file=Path,
+                            iodev=IODev,
+                            mode=Mode,
+                            start_lsn=StartLSN,
+                            next_lsn=NextLSN}};
+        E={error, _Reason} ->
+            E
+    end.
 
 -spec close_log(#log_state{}) -> 'ok'.
 
@@ -255,14 +263,22 @@ read_log_recs(LS=#log_state{file=F, mode=read, iodev=Dev},
 
 read_log_header(Dev) ->
     Magic = ?LOG_MAGIC,
-    {ok, <<Magic:8/binary, HData:?LOG_HDR_BYTES/binary>>} = file:read(Dev, 64),
-    {ok, Header=#log_header{version=?VERSION, start_lsn=StartLSN},
-         ?LOG_HDR_BYTES,
-         <<>>} =
-        decode_framed(fun wal_pb:decode_log_header/1,
-                      ?LOG_HDR_BYTES, HData),
-    case is_integer(StartLSN) of
-        true -> {ok, Header}
+    case file:read(Dev, 64) of
+        {ok, <<Magic:8/binary, HData:?LOG_HDR_BYTES/binary>>} ->
+            case decode_framed(fun wal_pb:decode_log_header/1,
+                               ?LOG_HDR_BYTES, HData) of
+                {ok,
+                 Header=#log_header{version=?VERSION, start_lsn=StartLSN},
+                 ?LOG_HDR_BYTES,
+                 <<>>} when is_integer(StartLSN) ->
+                    {ok, Header};
+                {partial, _} ->
+                    {error, corrupt_header}
+            end;
+        {ok, _} ->
+            {error, corrupt_header};
+        E={error, _} ->
+            E
     end.
 
 bytes_to_lsn_delta(Bytes) when Bytes rem ?LOG_ALIGN == 0 ->
@@ -303,6 +319,9 @@ encode_framed(Record, PadAlign) ->
     0 = TotalSize rem PadAlign,
     {ok, Data, TotalSize}.
 
+-spec decode_framed(fun((binary()) -> term()), non_neg_integer(), binary()) ->
+                           {'ok', term(), non_neg_integer(), binary()} |
+                           {'partial', binary()}.
 decode_framed(Decoder, Align,
               <<RSize:32, RBin:RSize/binary, CRC:32,
                 Trailing/binary>>) when is_integer(Align) ->
@@ -338,3 +357,51 @@ padding_bytes(Size, Align) ->
 unix_timestamp() ->
     {MegaSecs, Secs, _} = os:timestamp(),
     MegaSecs * 1000000 + Secs.
+
+
+%%%% Tests %%%%
+
+-ifdef(TEST).
+
+-define(setup_basic(F), {setup, fun start_basic/0, fun stop_basic/1, F}).
+
+start_basic() ->
+    Dir = "/tmp/wal",
+    ?assertCmd("sh -c 'if [ -e /tmp/wal ]; then rm -r /tmp/wal; fi'"),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    open_dir(Dir).
+
+stop_basic(_) ->
+    ok.
+
+corruption_test_() ->
+    [{"Corrupt header magic is detected",
+     ?setup_basic(fun mangle_log_header/1)},
+     {"Trailing garbage byte is detected",
+      ?setup_basic(fun append_stray_byte/1)},
+     {"Trailing garbage frame size is detected",
+      ?setup_basic(fun append_stray_frame_size/1)}].
+
+mangle_log_header({ready, Log, _, _}) ->
+    {ok, IODev} = file:open(Log, [write, binary, raw]),
+    ok = file:pwrite(IODev, 0, <<16#FEEDFACE, 16#CAFEBABE>>),
+    ok = file:close(IODev),
+    Res = wal:open_log(Log, read),
+    [?_assertMatch({error, _}, Res)].
+
+append_stray_byte({ready, Log, _, _}) ->
+    {ok, IODev} = file:open(Log, [write, binary, append, raw]),
+    ok = file:write(IODev, <<16#FC>>),
+    ok = file:close(IODev),
+    Res = wal:open_log(Log, read),
+    [?_assertMatch({error, _}, Res)].
+
+append_stray_frame_size({ready, Log, _, _}) ->
+    {ok, IODev} = file:open(Log, [write, binary, append, raw]),
+    ok = file:write(IODev, <<0:32>>),
+    ok = file:close(IODev),
+    Res = wal:open_log(Log, read),
+    [?_assertMatch({error, _}, Res)].
+
+
+-endif.
