@@ -148,7 +148,7 @@ pset_basic_add(_) ->
     P0 = passive_set:new(?SM, ?SM:from_binary(B0), Key, 1),
     P1 = passive_set:update({add, Elt}, P0),
     A0 = fetch_set(Key),
-    {ok, P2} = passive_set:sync(P1, crdt_service),
+    {ok, P2} = passive_set:sync(P1),
     A2 = fetch_set(Key),
     [?_assertEqual([], passive_set:value(P0)),
      ?_assertEqual([Elt], passive_set:value(P1)),
@@ -205,7 +205,7 @@ fetch_passive(Key, Replica) ->
     passive_set:new(?SM, fetch_set(Key), Key, Replica).
 
 sync_passive(PSet) ->
-    {ok, P2} = passive_set:sync(PSet, crdt_service),
+    {ok, P2} = passive_set:sync(PSet),
     P2.
     
 

@@ -17,6 +17,8 @@
 
 -type member()     :: term().
 -type set_op()     :: {'add', member()} | {'remove', member()}.
+-type request_id() :: {replica_id(), counter()}.
+-type pending_op() :: {request_id(), replica_id(), term()}.
 
 -record(set, {mod                    :: module(),
               crdt                   :: term(),
@@ -27,8 +29,7 @@
               adds=[]                :: ordsets:ordset(member()),
               rems=[]                :: ordsets:ordset(member()),
               sources=[crdt_service] :: [term()],
-              pending=none           :: counter() | 'none',
-              pending_replica=none   :: term() | 'none'
+              pending=none           :: pending_op() | 'none'
              }).
 -type set(CRDT)                      :: #set{crdt :: CRDT}.
 
@@ -58,11 +59,11 @@ value({contains, Elem},
 
 
 -spec update(set_op(), set(CRDT)) -> set(CRDT).
-update({add, E}, S=#set{adds=Adds, rems=Rems}) ->
+update({add, E}, S=#set{adds=Adds, rems=Rems, pending=none}) ->
     S#set{adds=ordsets:add_element(E, Adds),
           rems=ordsets:del_element(E, Rems)};
 update({remove, E},
-       S=#set{mod=CMod, crdt=CRDT, adds=Adds, rems=Rems}) ->
+       S=#set{mod=CMod, crdt=CRDT, adds=Adds, rems=Rems, pending=none}) ->
     case CMod:value({contains, E}, CRDT) of
         true ->
             %% if in the CRDT, remove from Adds, add to Rems
@@ -89,29 +90,21 @@ update({remove, E},
 -spec sync(set(CRDT)) -> {'ok', set(CRDT)} |
                          {'retry', set(CRDT)}.
 sync(S=#set{adds=[], rems=[], mod=CMod, crdt=CRDT, cid=CID,
-            sources=[Source|_]}) ->
+            sources=[Source|_], pending=none}) ->
     {ok, ResC, ResMAC} = crdt_service:fetch(Source, CID),
     Merged = CMod:merge(CRDT, CMod:from_binary(ResC)),
     {ok, S#set{crdt=Merged, mac=ResMAC}};
-sync(S=#set{adds=Adds, rems=Rems, cid=CID, sources=[Source|_]}) ->
-    Ops = ([ {passive_remove, E} || E <- Rems ]
-           ++ [ {passive_add, E} || E <- Adds ]),
-    Sender = crdt_service:send_passive_fun(Source, CID),
-    S3 = lists:foldl(fun(Op, S1) ->
-                             {ok, S2} = sync_op(Op, S1, Sender),
-                             S2
-                     end,
-                     S,
-                     Ops),
-    {ok, S3#set{adds=[], rems=[]}}.
+sync(S=#set{sources=[Source|_], rid=RID, next_req=Req, pending=none}) ->
+    {ok, Prep, _} = prepare_op(S),
+    RequestID = {RID, Req},
+    do_sync(S#set{pending={RequestID,Source,Prep}});
+sync(S=#set{pending=Pending}) when is_tuple(Pending) ->
+    do_sync(S).
 
-sync_op(Op, S=#set{mod=CMod, crdt=CRDT, rid=RID, next_req=Req}, Sender) ->
-    case CMod:prepare(Op, nil, CRDT) of
-        {ok, Prep, CRDT1} when CRDT == CRDT1 ->
-            RequestID = {RID, Req},
-            {ok, ResC, ResMAC} =
-                Sender(RequestID, Prep),
-
+do_sync(S=#set{cid=CID, pending={RequestID={_RID,ReqN},Source,Prep},
+               mod=CMod, crdt=CRDT}) ->
+    case crdt_service:passive_op(Source, CID, RequestID, Prep) of
+        {ok, ResC, ResMAC} ->
             %% XXX: merging invalidates the MAC, of course.
             %%
             %% Either keep a pristine one, or have the server ensure
@@ -120,10 +113,30 @@ sync_op(Op, S=#set{mod=CMod, crdt=CRDT, rid=RID, next_req=Req}, Sender) ->
             %% Or compute the delta (should be all removed) and send
             %% an appropriate remove operation, until the merge returns
             %% an identical CRDT.
-
             Merged = CMod:merge(CRDT, CMod:from_binary(ResC)),
-            {ok, S#set{next_req=Req+1, crdt=Merged, mac=ResMAC}}
+            {ok, S#set{next_req=ReqN+1, crdt=Merged, mac=ResMAC,
+                       adds=[], rems=[], pending=none}};
+        {error, _Reason} ->
+            {retry, S}
     end.
+            
+
+prepare_op(#set{adds=[], rems=[]}) ->
+    {error, noop};
+prepare_op(#set{mod=CMod, crdt=CRDT, adds=[AddE], rems=[]}) ->
+    CMod:prepare({passive_add, AddE}, nil, CRDT);
+prepare_op(#set{mod=CMod, crdt=CRDT, adds=Adds, rems=[]}) ->
+    CMod:prepare({passive_add_all, Adds}, nil, CRDT);
+prepare_op(#set{mod=CMod, crdt=CRDT, adds=[], rems=[RemE]}) ->
+    CMod:prepare({passive_remove, RemE}, nil, CRDT);
+prepare_op(#set{mod=CMod, crdt=CRDT, adds=[], rems=Rems}) ->
+    CMod:prepare({passive_remove_all, Rems}, nil, CRDT);
+prepare_op(S=#set{adds=Adds, rems=Rems})
+  when Adds /= [] andalso Rems /= [] ->
+    {ok, AddOp, _} = prepare_op(S#set{rems=[]}),
+    {ok, RemOp, _} = prepare_op(S#set{adds=[]}),
+    {ok, {update, [AddOp, RemOp]}, S}.
+
 
 randomize_nodes(Nodes) ->
     S = lists:keysort(1, [{random:uniform(), Node} || Node <- Nodes]),

@@ -179,6 +179,10 @@ update({remove_all, Elems}, Actor, ORSet) ->
 
 prepare({passive_add, Elem}, _Actor, Set) ->
     {ok, {add, Elem}, Set};
+
+prepare({passive_add_all, Elts}, _Actor, Set) ->
+    {ok, {add_all, Elts}, Set};
+
 prepare({passive_remove, Elem}, _Actor, Set={_Clock, Entries}) ->
     case orddict:find(Elem, Entries) of
         {ok, Dots} ->
@@ -186,18 +190,73 @@ prepare({passive_remove, Elem}, _Actor, Set={_Clock, Entries}) ->
         error ->
             {error, {precondition, {not_present, Elem}}}
     end;
+
+prepare({passive_remove_all, Elts}, Actor, Set) ->
+    prepare_all(fun(Prep) ->
+                        {remove_all_versions,
+                         [{Elem, Dots} || {remove_versions, Elem, Dots} <- Prep]}
+                end,
+                Actor,
+                Set,
+                [{passive_remove, Elem} || Elem <- Elts]);
+
 prepare({add, Elem}, Actor, {Clock, Entries}) ->
     NewClock = riak_dt_vclock:increment(Actor, Clock),
     Dot = {Actor, riak_dt_vclock:get_counter(Actor, NewClock)},
     {ok, {add_at, Elem, Dot}, {NewClock, Entries}};
+
+prepare({add_all, Elts}, Actor, Set) ->
+    prepare_all(fun(Prep) ->
+                       {add_all_at,
+                        [{Elem, Dot} || {add_at, Elem, Dot} <- Prep]}
+                end,
+                Actor,
+                Set,
+                [{add, Elem} || Elem <- Elts]);
+
 prepare(Op={remove_versions, _Elem, _Dots}, Actor, Set) ->
     case check_precondition(Op, Actor, Set) of
         ok ->
             {ok, Op, Set};
         {precondition, Cond} ->
             {error, {precondition, Cond}}
-    end.
+    end;
 
+prepare(Op={remove_all_versions, Elts}, Actor, Set) ->
+    case lists:all(fun({Elem, Dots}) ->
+                           case check_precondition({remove_versions, Elem, Dots},
+                                                   Actor, Set) of
+                               ok ->
+                                   true;
+                               {precondition, _} ->
+                                   false
+                           end
+                   end,
+                   Elts) of
+        true ->
+            {ok, Op, Set};
+        false ->
+            {error, {precondition, unspec}}
+    end;
+
+prepare({update, Ops}, Actor, Set) ->
+    prepare_all(fun(Prep) -> {update, Prep} end,
+                Actor,
+                Set,
+                Ops).
+
+prepare_all(Fun, Actor, Set, Elts) ->
+    prepare_all(Fun, Actor, Set, Elts, []).
+
+prepare_all(Fun, _Actor, Set, [], Acc) ->
+    {ok, Fun(lists:reverse(Acc)), Set};
+prepare_all(Fun, Actor, Set, [X|XS], Acc) ->
+    case prepare(X, Actor, Set) of
+        {ok, Prep, Set1} ->
+            prepare_all(Fun, Actor, Set1, XS, [Prep|Acc]);
+        E={error, _Reason} ->
+            E
+    end.
 
 effect(Op={add_at, Elem, Dot}, Actor, Set={Clock, Entries}) ->
     case check_precondition(Op, Actor, Set) of
@@ -207,6 +266,11 @@ effect(Op={add_at, Elem, Dot}, Actor, Set={Clock, Entries}) ->
         duplicate ->
             {ok, Set}
     end;
+
+effect({add_all_at, Entries}, Actor, Set) ->
+    efold(fun effect/3, Actor, Set,
+          [{add_at, Elem, Dot} || {Elem, Dot} <- Entries]);
+
 effect(Op={remove_versions, Elem, RmDots}, Actor, Set={Clock, Entries}) ->
     case check_precondition(Op, Actor, Set) of
         ok ->
@@ -230,6 +294,23 @@ effect(Op={remove_versions, Elem, RmDots}, Actor, Set={Clock, Entries}) ->
         {precondition, Cond} ->
             % not a descendant of the versions we're meant to remove!
             {error, {precondition, Cond}}
+    end;
+
+effect({remove_all_versions, Entries}, Actor, Set) ->
+    efold(fun effect/3, Actor, Set,
+          [{remove_versions, Elem, Dots} || {Elem, Dots} <- Entries]);
+
+effect({update, Ops}, Actor, Set) ->
+    efold(fun effect/3, Actor, Set, Ops).
+
+efold(_Fun, _Actor, Set, []) ->
+    {ok, Set};
+efold(Fun, Actor, Set, [X|XS]) ->
+    case Fun(X, Actor, Set) of
+        {ok, Set1} ->
+            efold(Fun, Actor, Set1, XS);
+        E={error, _Reason} ->
+            E
     end.
 
 check_precondition({add_at, _Elem, Dot={Actor, OpCtr}},
@@ -608,6 +689,21 @@ passive_add_test() ->
     ?assert(value({contains, "moose"}, AS2)),
     _Bin = to_binary(AS2).
 
+passive_add_all_test() ->
+    Set = new(),
+    {ok, PrepA, _AS1} =
+        prepare({add_all, ["moose", "squirrel"]}, active, Set),
+    ?assertMatch({add_all_at, [{"moose",    {active, 1}},
+                               {"squirrel", {active, 2}}]},
+                 PrepA),
+    {ok, AS2} = effect(PrepA, active, Set),
+    ?assertMatch(["moose", "squirrel"], value(AS2)),
+    ?assertMatch({[{active, 2}],
+                  [{"moose",    [{active, 1}]},
+                   {"squirrel", [{active, 2}]}]},
+                 AS2),
+    _Bin = to_binary(AS2).
+
 prep_remove_test() ->
     Set = new(),
     Actor = a1,
@@ -634,6 +730,18 @@ passive_remove_test() ->
     {ok, PrepA, _AS2} = prepare(PrepP, active, S2),
     {ok, AS3} = effect(PrepA, active, S2),
     ?assertNot(value({contains, "moose"}, AS3)).
+
+passive_remove_all_test() ->
+    S0 = new(),
+    {ok, S1} = update({add_all, ["moose", "squirrel"]}, active1, S0),
+    {ok, S2} = update({add, "moose"}, active2, S1),
+    {ok, PrepA, _S1a} = prepare({passive_remove_all, ["moose", "squirrel"]},
+                                passive1,
+                                S1),
+    {ok, PrepB, _S2a} = prepare(PrepA, active1, S2),
+    {ok, S3} = effect(PrepB, active1, S2),
+    ?assertEqual(["moose"], value(S3)).
+    
 
 
 -endif.
