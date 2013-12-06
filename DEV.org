@@ -54,6 +54,10 @@ crdt_service:passive_op(crdt_service, "abc", {1,7}, {add, "compasses"}).
 crdt_service:passive_op(crdt_service, "abc", {1,8}, {add, "dividers"}).
 crdt_service:passive_op(crdt_service, "abc", {1,9}, {add, "erasers"}).
 
+crdt_service:passive_op(crdt_service, "abc", {2,1}, {add, "dividers"}).
+crdt_service:passive_op(crdt_service, "abc", {2,3},
+                        {remove_versions, "parsnips", [{'krypton@GSV-Full-Internal-Reflection',2}]}).
+
 wal_mgr:take_checkpoint().
 wal_mgr:start_req_checkpoint().
 
@@ -74,6 +78,12 @@ crdt_service:value(crdt_service, "keys").
 P1 = passive_set:fetch("abc", 100, nodes(), logged_orswot).
 #+END_EXAMPLE
 
+** Load generation
+#+BEGIN_EXAMPLE
+net_kernel:connect_node('argon@GSV-Full-Internal-Reflection').  
+net_kernel:connect_node('krypton@GSV-Full-Internal-Reflection').
+dummy_client:test_client_crdt(dummy_client:passive_runner("abc", "words")).
+#+END_EXAMPLE
 ** JSON
 
 #+BEGIN_EXAMPLE
@@ -82,6 +92,10 @@ C1 = logged_orswot:from_binary(CBin).
 jiffy:encode(C1).
 ** exception throw: {error,invalid_ejson}
      in function  jiffy:encode/2 (src/jiffy.erl, line 34)
+#+END_EXAMPLE
+
+#+BEGIN_EXAMPLE
+{ "item7": [{"R": 123, "U": 456}]}
 #+END_EXAMPLE
 
 * Development tasks
