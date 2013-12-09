@@ -40,9 +40,21 @@ new(Mod, CRDT, CID, RID) ->
 -spec fetch(string() | binary(), replica_id(), [term()], module()) -> #set{}.
 fetch(Key, Replica, NodesOrig, Mod) ->
     Nodes = randomize_nodes(NodesOrig),
-    {ok, CBin, MAC} = crdt_service:fetch(hd(Nodes), Key),
-    #set{cid=Key, mod=Mod, crdt=Mod:from_binary(CBin), mac=MAC,
-         rid=Replica, sources=Nodes}.
+    S=#set{} = try_fetch(Key, Replica, Mod, Nodes, []),
+    S.
+
+try_fetch(_Key, _Replica, _Mod, [], _Tried) ->
+    {error, notfound};
+try_fetch(Key, Replica, Mod, [Node|NS], Tried) ->
+    case crdt_service:fetch(Node, Key) of
+        {ok, CBin, MAC} ->
+            #set{cid=Key, mod=Mod, crdt=Mod:from_binary(CBin), mac=MAC,
+                 rid=Replica, sources=[Node|NS] ++ Tried};
+        {error, notfound} ->
+            try_fetch(Key, Replica, Mod, NS, [Node|Tried]);
+        E={error, _Reason} ->
+            E
+    end.
 
 -spec value(set(_CRDT)) -> [member()].
 value(#set{mod=Mod, crdt=CRDT, adds=Adds, rems=Rems}) ->
@@ -94,12 +106,23 @@ sync(S=#set{adds=[], rems=[], mod=CMod, crdt=CRDT, cid=CID,
     {ok, ResC, ResMAC} = crdt_service:fetch(Source, CID),
     Merged = CMod:merge(CRDT, CMod:from_binary(ResC)),
     {ok, S#set{crdt=Merged, mac=ResMAC}};
-sync(S=#set{sources=[Source|_], rid=RID, next_req=Req, pending=none}) ->
+sync(S=#set{sources=Sources, rid=RID, next_req=Req, pending=none}) ->
     {ok, Prep, _} = prepare_op(S),
     RequestID = {RID, Req},
-    do_sync(S#set{pending={RequestID,Source,Prep}});
+    sync_select(S, [{RequestID, Source, Prep} || Source <- Sources]);
+    %%do_sync(S#set{pending={RequestID,Source,Prep}});
 sync(S=#set{pending=Pending}) when is_tuple(Pending) ->
     do_sync(S).
+
+sync_select(#set{}, []) ->
+    {error, no_replica};
+sync_select(S=#set{}, [Pending|PS]) ->
+    case do_sync(S#set{pending=Pending}) of
+        switch ->
+            sync_select(S, PS);
+        Res ->
+            Res
+    end.
 
 do_sync(S=#set{cid=CID, pending={RequestID={_RID,ReqN},Source,Prep},
                mod=CMod, crdt=CRDT}) ->
@@ -116,10 +139,17 @@ do_sync(S=#set{cid=CID, pending={RequestID={_RID,ReqN},Source,Prep},
             Merged = CMod:merge(CRDT, CMod:from_binary(ResC)),
             {ok, S#set{next_req=ReqN+1, crdt=Merged, mac=ResMAC,
                        adds=[], rems=[], pending=none}};
+        {error, notfound} ->
+            switch;
+        {error, {precondition, Cond}} ->
+            io:format("Precondition failed at source ~p: ~p~n",
+                      [Source, Cond]),
+            switch;
         {error, _Reason} ->
             {retry, S}
     end.
-            
+
+
 
 prepare_op(#set{adds=[], rems=[]}) ->
     {error, noop};
