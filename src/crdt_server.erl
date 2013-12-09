@@ -269,5 +269,5 @@ stored(#state{cid=CID, mod=Mod, mac_key=Key, crdt=CRDT, lsn=LSN}) ->
 ret_crdt(#state{mod=Mod, crdt=CRDT, mac_key=Key}) ->
     %% io:format("Returning CRDT from state:~n~p~n", [S]),
     CBin = Mod:to_binary(CRDT),
-    MAC = crypto:sha_mac(Key, CBin),
+    MAC = crypto:hmac(sha, Key, CBin),
     {ok, CBin, MAC}.
