@@ -7,7 +7,8 @@
                   kernel,
                   stdlib,
                   crypto,
-                  riak_dt
+                  riak_dt,
+                  folsom
                  ]},
   {mod, { crdt_wal_app, []}},
   {env, []}

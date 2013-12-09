@@ -110,8 +110,13 @@ init({Actor, CID, {sync, Mod}}) ->
 %%     {ok, #state{}}.
 
 handle_call({passive_op, RequestID, Op}, _From, S0=#state{mode=normal}) ->
-    {ok, S} = do_passive(RequestID, Op, S0),
-    {reply, ret_crdt(S), S};
+    folsom_metrics:notify({passive_ops_s,1}),
+    folsom_metrics:safely_histogram_timed_update(
+      passive_op_t,
+      fun() ->
+              {ok, S} = do_passive(RequestID, Op, S0),
+              {reply, ret_crdt(S), S}
+      end) ;
 
 handle_call(fetch, _From, S=#state{mode=normal}) ->
     {reply, ret_crdt(S), S};
@@ -126,11 +131,16 @@ handle_call(finish_recovery, _From, S0=#state{mode=recovery}) ->
 
 
 handle_cast({{passive_op, RequestID, Op}, From}, S0=#state{mode=normal}) ->
-    {ok, S} = do_passive(RequestID, Op, S0),
-    Reply = ret_crdt(S),
-    gen_server:reply(From, Reply),
-    ok = replicate(S),
-    {noreply, S};
+    folsom_metrics:notify({passive_ops_s,1}),
+    folsom_metrics:safely_histogram_timed_update(
+      passive_op_t,
+      fun() ->
+              {ok, S} = do_passive(RequestID, Op, S0),
+              Reply = ret_crdt(S),
+              gen_server:reply(From, Reply),
+              ok = replicate(S),
+              {noreply, S}
+      end);
 
 handle_cast({fetch, From}, S=#state{mode=normal}) ->
     Reply = ret_crdt(S),
