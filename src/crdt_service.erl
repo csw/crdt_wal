@@ -20,7 +20,8 @@
 -type crdt_op()    :: term().
 -type crdt_state() :: binary().
 -type crdt_mac()   :: binary().
--type crdt_state_reply() :: {'ok', crdt_state(), crdt_mac()}.
+-type crdt_state_reply() :: {'ok', crdt_state(), crdt_mac()} |
+                            {'error', term()}.
 
 
 -record(state, {actor         :: riak_dt:actor(),
