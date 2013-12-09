@@ -1,0 +1,20 @@
+#!/usr/bin/env escript
+%%! -smp enable -sname driver -hidden -pz ebin deps/riak_dt/ebin
+
+setup() ->
+    Svc = {crdt_service, 'argon@GSV-Full-Internal-Reflection'},
+    case crdt_service:fetch(Svc, "abc") of
+        {ok, _, _} ->
+            ok;
+        {error, not_found} ->
+            {ok, _, _} = crdt_service:create(Svc, "abc", logged_orswot),
+            ok
+    end.
+
+main(_Args) ->
+    net_kernel:connect_node('argon@GSV-Full-Internal-Reflection'),
+    net_kernel:connect_node('krypton@GSV-Full-Internal-Reflection'),
+
+    ok = setup(),
+    dummy_client:test_client_crdt(dummy_client:passive_runner("abc", "words")).
+    %%dummy_client:run_client(10, 1, dummy_client:passive_runner("abc", "words")).
