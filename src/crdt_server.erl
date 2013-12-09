@@ -161,11 +161,11 @@ handle_cast(sync_write, S=#state{}) ->
     ok = storage:store_crdt_sync(stored(S)),
     {noreply, S};
 
-handle_cast({replicate, CBin}, S=#state{mod=Mod, crdt=CRDT, mode=Mode})
+handle_cast({replicate, CBin}, S=#state{mode=Mode})
   when Mode == init_sync; Mode == normal ->
     io:format("Received replication update, merging.~n"),
     {ok, MS} = commit_record({merge, CBin}, S),
-    {noreply, MS};
+    {noreply, MS#state{mode=normal}};
 
 handle_cast(dump, S=#state{cid=Key, crdt=CRDT}) ->
     io:format("CRDT ~p: ~p~n", [Key, CRDT]),
