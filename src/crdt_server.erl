@@ -260,7 +260,14 @@ apply_record({merge, CBin}, OpLSN,
     S1 = S#state{crdt=Merged, lsn=LSN},
     ok = storage:store_crdt(stored(S1)),
     ok = wal_mgr:clean_record(OpLSN, data),
-    {ok, S1}.
+    {ok, S1};
+
+apply_record({merge, _CBin}, OpLSN, S=#state{lsn=LSN})
+  when OpLSN =< LSN ->
+    ok = wal_mgr:clean_record(OpLSN, data),
+    io:format("Skipping log record ~16.16.0B, already at ~16.16.0B.~n",
+              [OpLSN, LSN]),
+    {ok, S}.
 
 stored(#state{cid=CID, mod=Mod, mac_key=Key, crdt=CRDT, lsn=LSN}) ->
     {CID, Mod, Key, Mod:to_binary(CRDT), LSN}.
