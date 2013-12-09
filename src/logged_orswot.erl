@@ -289,7 +289,7 @@ effect(Op={remove_versions, Elem, RmDots}, Actor, Set={Clock, Entries}) ->
                     {ok, {Clock, ResEntries}};
                 error ->
                     %% not present, no-op
-                    Set
+                    {ok, Set}
             end;
         {precondition, Cond} ->
             % not a descendant of the versions we're meant to remove!
